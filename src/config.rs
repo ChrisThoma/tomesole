@@ -23,6 +23,13 @@ pub struct Config {
     pub max_size: Option<u64>,
     /// Set to false to skip MD5 verification. Strongly discouraged.
     pub verify: Option<bool>,
+    /// What to hand a downloaded book to. On macOS this names an application
+    /// for `open -a`; elsewhere it is a command run with the file as argument.
+    pub reader: Option<String>,
+    /// Set to false to stop recording what was downloaded.
+    pub history: Option<bool>,
+    /// Set to false to never fetch or draw cover art.
+    pub covers: Option<bool>,
 }
 
 impl Config {
@@ -76,6 +83,13 @@ impl Config {
                 }
                 "allow_http" => cfg.allow_http = parse_bool(last)?,
                 "verify" => cfg.verify = Some(parse_bool(last)?),
+                "reader" | "viewer" => {
+                    if !last.trim().is_empty() {
+                        cfg.reader = Some(last.trim().to_string());
+                    }
+                }
+                "history" => cfg.history = Some(parse_bool(last)?),
+                "covers" | "cover_art" => cfg.covers = Some(parse_bool(last)?),
                 "max_size" => {
                     cfg.max_size = Some(
                         crate::model::parse_size(last)
@@ -166,6 +180,20 @@ pub fn mirror_cache_path() -> PathBuf {
     cache_dir().join("mirrors.tsv")
 }
 
+/// Downloaded cover thumbnails. Cache, not data: losing it costs a refetch.
+pub fn cover_cache_dir() -> PathBuf {
+    cache_dir().join("covers")
+}
+
+/// Where state the user would miss lives, as opposed to state we can rebuild.
+pub fn data_dir() -> PathBuf {
+    xdg_dir("XDG_DATA_HOME", ".local/share").join("clibgen")
+}
+
+pub fn history_path() -> PathBuf {
+    data_dir().join("history.tsv")
+}
+
 /// The default place downloads land: `~/Downloads` when it exists, else cwd.
 pub fn default_download_dir() -> PathBuf {
     let downloads = home_dir().join("Downloads");
@@ -179,6 +207,23 @@ pub fn default_download_dir() -> PathBuf {
 pub fn ensure_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("could not create directory {}", path.display()))
+}
+
+/// Create (or truncate) a file readable only by the current user.
+///
+/// Used for partial downloads and for the history file: both record what
+/// someone has been reading, which is nobody else's business.
+pub fn create_private_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("could not create {}", path.display()))
 }
 
 /// The commented template written by `clibgen config --init`.
@@ -206,6 +251,18 @@ pub const TEMPLATE: &str = "\
 # Turning this off removes the only integrity check available. Don't.
 # verify = true
 
+# What `clibgen open` hands a book to. On macOS this is an application name,
+# passed to `open -a`; elsewhere it is a command run with the file as its
+# argument. Unset means the system default for the file type.
+# reader = Books
+# reader = zathura
+
+# Keep a record of what has been downloaded, for `clibgen history`.
+# history = true
+
+# Fetch and draw cover art in the full-screen interface.
+# covers = true
+
 # Permit cleartext http mirrors. Off unless you have a specific reason.
 # allow_http = false
 ";
@@ -227,6 +284,9 @@ mod tests {
             max_size = 2 GB
             verify = false
             allow_http = yes
+            reader = Books
+            history = no
+            covers = off
             "#,
         )
         .unwrap();
@@ -240,6 +300,9 @@ mod tests {
         assert_eq!(cfg.max_size, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(cfg.verify, Some(false));
         assert!(cfg.allow_http);
+        assert_eq!(cfg.reader.as_deref(), Some("Books"));
+        assert_eq!(cfg.history, Some(false));
+        assert_eq!(cfg.covers, Some(false));
         assert!(cfg.download_dir.unwrap().ends_with("Books"));
     }
 

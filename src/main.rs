@@ -12,14 +12,20 @@
 
 mod args;
 mod config;
+mod cover;
 mod download;
 mod error;
+mod graphics;
+mod history;
 mod html;
+mod jpeg;
+mod launch;
 mod libgen;
 mod md5;
 mod mirror;
 mod model;
 mod net;
+mod query;
 mod term;
 mod tui;
 mod ui;
@@ -77,6 +83,12 @@ fn run(argv: &[String], style: &Style) -> Result<i32> {
         Command::Config { init, path } => cmd_config(*init, *path, style),
         Command::Doctor => cmd_doctor(&cli, &config, style),
         Command::Mirrors { refresh } => cmd_mirrors(&cli, &config, *refresh, style),
+        Command::History { limit, clear } => cmd_history(&cli, &config, *limit, *clear, style),
+        Command::Open {
+            selector,
+            reveal,
+            with,
+        } => cmd_open(selector, *reveal, with.as_deref(), &cli, &config, style),
         Command::Tui { query } => {
             // Without a terminal there is nothing to draw on, so fall back to
             // the help text rather than failing obscurely.
@@ -106,6 +118,12 @@ pub struct Settings {
     pub quiet: bool,
     pub json: bool,
     pub output: Option<String>,
+    /// Application to open downloaded books with. None means the system default.
+    pub reader: Option<String>,
+    /// Record what gets downloaded.
+    pub history: bool,
+    /// Fetch and draw cover art.
+    pub covers: bool,
 }
 
 pub fn settings(global: &Global, config: &Config) -> Settings {
@@ -143,6 +161,9 @@ pub fn settings(global: &Global, config: &Config) -> Settings {
         quiet: global.quiet,
         json: global.json,
         output: global.output.clone(),
+        reader: global.reader.clone().or_else(|| config.reader.clone()),
+        history: config.history.unwrap_or(true),
+        covers: !global.no_covers && config.covers.unwrap_or(true),
     }
 }
 
@@ -192,7 +213,7 @@ fn cmd_search(cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
     };
     let settings = settings(&cli.global, config);
 
-    let mut query = SearchQuery::new(search.terms.join(" "));
+    let mut query = SearchQuery::new(String::new());
     query.fields = search.fields.clone();
     if !search.topics.is_empty() {
         query.topics = search.topics.clone();
@@ -202,6 +223,13 @@ fn cmd_search(cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
     query.limit = search.limit.or(config.limit).unwrap_or(25);
     query.extension = search.extension.clone();
     query.language = search.language.clone();
+    // `author:herbert dune` works here as well as in the interface; explicit
+    // flags have already been set above and are left alone.
+    query::apply(&search.terms.join(" "), &mut query);
+
+    if query.terms.trim().is_empty() {
+        return Err(crate::err!("there is nothing to search for"));
+    }
 
     let pool = resolve_pool(&settings, style)?;
     let http = Http::new(settings.policy)?;
@@ -235,11 +263,22 @@ fn cmd_search(cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
     }
 
     if books.is_empty() {
+        // When the query carried filters, say so — a search that found plenty
+        // and then filtered it all away looks identical to one that found
+        // nothing, and the fix is different.
+        let advice = if query::parse(&search.terms.join(" ")).is_tagged()
+            || query.extension.is_some()
+            || query.language.is_some()
+        {
+            "Try fewer words, or drop the format and language filters."
+        } else {
+            "Try fewer words."
+        };
         eprintln!(
             "\n  {} nothing found for “{}”.\n  {}\n",
             style.yellow("∅"),
             query.terms,
-            style.dim("Try fewer words, or drop the --ext / --lang filters.")
+            style.dim(advice)
         );
         return Ok(1);
     }
@@ -348,6 +387,7 @@ fn cmd_get(md5: &str, cli: &Cli, config: &Config, style: &Style) -> Result<i32> 
     bar.clear();
     match result {
         Ok(outcome) => {
+            history::record(settings.history, &resolved.book, &outcome);
             report(&outcome, &resolved.book, &settings, style);
             Ok(0)
         }
@@ -394,6 +434,7 @@ fn download_one(
         |_, _| {},
     )?;
 
+    history::record(settings.history, book, &outcome);
     report(&outcome, book, settings, style);
     Ok(())
 }
@@ -498,6 +539,137 @@ fn cmd_mirrors(cli: &Cli, config: &Config, refresh: bool, style: &Style) -> Resu
     Ok(if healthy == 0 { 1 } else { 0 })
 }
 
+fn cmd_history(
+    cli: &Cli,
+    config: &Config,
+    limit: Option<usize>,
+    clear: bool,
+    style: &Style,
+) -> Result<i32> {
+    let settings = settings(&cli.global, config);
+
+    if clear {
+        history::clear()?;
+        // Which covers were fetched says as much about what someone has been
+        // reading as the download list does, so it goes too.
+        cover::clear_cache()?;
+        eprintln!(
+            "  {} download history and cached covers cleared\n",
+            style.green("✓")
+        );
+        return Ok(0);
+    }
+
+    let mut entries = history::load();
+    if let Some(limit) = limit {
+        entries.truncate(limit);
+    }
+
+    if settings.json {
+        print!("{}", ui::json_history(&entries));
+        return Ok(if entries.is_empty() { 1 } else { 0 });
+    }
+
+    if entries.is_empty() {
+        eprintln!(
+            "\n  {} nothing downloaded yet.\n  {}\n",
+            style.dim("•"),
+            style.dim(if settings.history {
+                "Downloads are recorded here as you make them."
+            } else {
+                "Recording is off — set `history = true` in the config to keep a list."
+            })
+        );
+        return Ok(0);
+    }
+
+    if settings.quiet {
+        for entry in &entries {
+            println!("{}", entry.path.display());
+        }
+        return Ok(0);
+    }
+
+    eprintln!();
+    print!("{}", ui::render_history(&entries, style));
+
+    let gone = entries.iter().filter(|e| !e.present()).count();
+    if gone > 0 {
+        eprintln!(
+            "\n  {} {}",
+            style.red("!"),
+            style.dim(&format!(
+                "{gone} of these {} no longer where {} downloaded",
+                if gone == 1 { "is" } else { "are" },
+                if gone == 1 { "it was" } else { "they were" }
+            ))
+        );
+    }
+    eprintln!(
+        "\n  {}\n",
+        style.dim(
+            "`clibgen open 1` to read the newest, `clibgen reveal 1` to show it in the file manager"
+        )
+    );
+    Ok(0)
+}
+
+fn cmd_open(
+    selector: &str,
+    reveal: bool,
+    with: Option<&str>,
+    cli: &Cli,
+    config: &Config,
+    style: &Style,
+) -> Result<i32> {
+    let settings = settings(&cli.global, config);
+    let entries = history::load();
+    if entries.is_empty() {
+        return Err(crate::err!(
+            "nothing has been downloaded yet, so there is nothing to open"
+        ));
+    }
+
+    let matches = history::select(&entries, selector)?;
+    let entry = match matches.as_slice() {
+        [only] => *only,
+        many => {
+            // Several entries answer to that name, so ask rather than guess.
+            let list: Vec<history::Entry> = many.iter().map(|e| (*e).clone()).collect();
+            eprintln!(
+                "\n  {} match “{selector}”\n",
+                style.bold(&format!("{} downloads", list.len()))
+            );
+            print!("{}", ui::render_history(&list, style));
+            match ui::prompt_selection(list.len(), style)? {
+                Some(picks) => many[picks[0]],
+                None => {
+                    eprintln!();
+                    return Ok(0);
+                }
+            }
+        }
+    };
+
+    let reader = with.or(settings.reader.as_deref());
+    if reveal {
+        launch::reveal(&entry.path)?;
+    } else {
+        launch::open(&entry.path, reader)?;
+    }
+
+    if !settings.quiet {
+        let verb = if reveal { "showing" } else { "opening" };
+        eprintln!(
+            "\n  {} {verb} {}\n    {}\n",
+            style.green("✓"),
+            style.bold(&entry.filename()),
+            style.dim(&entry.path.display().to_string())
+        );
+    }
+    Ok(0)
+}
+
 fn cmd_config(init: bool, path_only: bool, style: &Style) -> Result<i32> {
     let path = config::config_path();
 
@@ -567,6 +739,51 @@ fn cmd_doctor(cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
             style.red("no — downloads will fail")
         },
     );
+    row(
+        "history",
+        if settings.history {
+            let count = history::load().len();
+            format!(
+                "{} {}",
+                config::history_path().display(),
+                style.dim(&format!("({count} entries)"))
+            )
+        } else {
+            style.yellow("off")
+        },
+    );
+    row(
+        "reader",
+        match settings.reader.as_deref() {
+            Some(app) => app.to_string(),
+            None => style.dim("system default"),
+        },
+    );
+    row(
+        "cover art",
+        if !settings.covers {
+            style.dim("off").to_string()
+        } else {
+            match graphics::detect() {
+                graphics::Protocol::Kitty => format!("{} (kitty graphics)", style.green("on")),
+                graphics::Protocol::ITerm2 => format!("{} (iTerm2 inline)", style.green("on")),
+                graphics::Protocol::Blocks => {
+                    format!("{} (colour blocks — no image protocol)", style.green("on"))
+                }
+                graphics::Protocol::None => style.yellow("no colour support in this terminal"),
+            }
+        },
+    );
+    let (covers, cover_bytes) = cover::cache_size();
+    if covers > 0 {
+        row(
+            "covers cached",
+            style.dim(&format!(
+                "{covers} files, {}",
+                model::human_bytes(cover_bytes)
+            )),
+        );
+    }
     row("max size", model::human_bytes(settings.max_bytes));
     row(
         "verify md5",

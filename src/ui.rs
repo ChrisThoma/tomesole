@@ -93,6 +93,137 @@ pub fn render_results(books: &[Book], style: &Style) -> String {
     out
 }
 
+/// Render the download history as an aligned table.
+///
+/// Entries whose file has since been moved or deleted are still listed — a
+/// history that quietly forgets things is worse than one that admits the file
+/// is gone — but they are marked, and dimmed.
+pub fn render_history(entries: &[crate::history::Entry], style: &Style) -> String {
+    const W_WHEN: usize = 12;
+    /// A one-character column for the "this file is gone" mark.
+    ///
+    /// It has a column of its own rather than a suffix on the title because a
+    /// long title is truncated, and the one row that most needs the mark is
+    /// exactly the one where it would be cut off.
+    const W_MARK: usize = 1;
+    let now = crate::history::now();
+
+    let width = terminal_width();
+    let fixed = W_INDEX + W_MARK + W_WHEN + W_SIZE + W_EXT;
+    let flex = width.saturating_sub(INDENT + fixed + GAP * 6);
+    let w_title = ((flex as f64 * 0.62) as usize).max(20);
+    let w_author = flex.saturating_sub(w_title).max(12);
+
+    let gap = " ".repeat(GAP);
+    let indent = " ".repeat(INDENT);
+    let mut out = String::new();
+
+    let header = format!(
+        "{indent}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
+        pad_left("#", W_INDEX),
+        pad("", W_MARK),
+        pad("Title", w_title),
+        pad("Author", w_author),
+        pad("When", W_WHEN),
+        pad_left("Size", W_SIZE),
+        pad("Fmt", W_EXT),
+    );
+    out.push_str(&style.dim(header.trim_end()));
+    out.push('\n');
+
+    let rule = format!(
+        "{indent}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
+        "─".repeat(W_INDEX),
+        "─".repeat(W_MARK),
+        "─".repeat(w_title),
+        "─".repeat(w_author),
+        "─".repeat(W_WHEN),
+        "─".repeat(W_SIZE),
+        "─".repeat(W_EXT),
+    );
+    out.push_str(&style.dim(&rule));
+    out.push('\n');
+
+    for (i, entry) in entries.iter().enumerate() {
+        let present = entry.present();
+        // A gone file gets no colour at all, so the eye skips it.
+        let paint = |text: &str| {
+            if present {
+                text.to_string()
+            } else {
+                style.dim(text)
+            }
+        };
+
+        let row = format!(
+            "{indent}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
+            style.cyan(&pad_left(&(i + 1).to_string(), W_INDEX)),
+            if present {
+                pad("", W_MARK)
+            } else {
+                style.red(&pad("!", W_MARK))
+            },
+            paint(&pad(&truncate(&entry.title, w_title), w_title)),
+            style.dim(&pad(&truncate(&entry.first_author(), w_author), w_author)),
+            style.dim(&pad(
+                &truncate(&crate::history::when(entry.at, now), W_WHEN),
+                W_WHEN
+            )),
+            style.dim(&pad_left(
+                &truncate(&crate::model::human_bytes(entry.size), W_SIZE),
+                W_SIZE
+            )),
+            if present {
+                style.green(&pad(&truncate(entry.ext(), W_EXT), W_EXT))
+            } else {
+                style.dim(&pad(&truncate(entry.ext(), W_EXT), W_EXT))
+            },
+        );
+        out.push_str(row.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Serialise the download history as JSON.
+pub fn json_history(entries: &[crate::history::Entry]) -> String {
+    let mut out = String::from("[\n");
+    for (i, entry) in entries.iter().enumerate() {
+        out.push_str("  {\n");
+        let mut fields: Vec<String> = vec![
+            format!("    \"downloaded_at\": {}", entry.at),
+            format!(
+                "    \"downloaded_at_utc\": \"{}\"",
+                crate::history::timestamp(entry.at)
+            ),
+            format!("    \"md5\": \"{}\"", json_escape(&entry.md5)),
+            format!("    \"title\": \"{}\"", json_escape(&entry.title)),
+            format!(
+                "    \"path\": \"{}\"",
+                json_escape(&entry.path.to_string_lossy())
+            ),
+            format!("    \"size_bytes\": {}", entry.size),
+            format!("    \"verified\": {}", entry.verified),
+            format!("    \"present\": {}", entry.present()),
+        ];
+        if let Some(authors) = entry.authors.as_deref().filter(|a| !a.trim().is_empty()) {
+            fields.push(format!("    \"authors\": \"{}\"", json_escape(authors)));
+        }
+        if let Some(ext) = entry.extension.as_deref().filter(|e| !e.is_empty()) {
+            fields.push(format!("    \"extension\": \"{}\"", json_escape(ext)));
+        }
+        out.push_str(&fields.join(",\n"));
+        out.push('\n');
+        out.push_str(if i + 1 == entries.len() {
+            "  }\n"
+        } else {
+            "  },\n"
+        });
+    }
+    out.push_str("]\n");
+    out
+}
+
 /// Render mirror health as a table.
 pub fn render_mirror_table(statuses: &[MirrorStatus], style: &Style) -> String {
     let host_width = statuses
@@ -322,6 +453,81 @@ mod tests {
         for line in rendered.lines() {
             assert!(display_width(line) <= width, "{line:?}");
         }
+    }
+
+    fn history_entries() -> Vec<crate::history::Entry> {
+        vec![
+            crate::history::Entry {
+                at: crate::history::now() - 7200,
+                md5: "1b9159991f7fb1b3910c0be9ebf7e595".into(),
+                // Long enough that anything appended to it is truncated away.
+                path: std::path::PathBuf::from("/definitely/not/here/a.epub"),
+                size: 3 * 1024 * 1024,
+                verified: true,
+                title: "Saga Dune 1-6. La mayor epopeya de todos los tiempos: edición estuche"
+                    .into(),
+                authors: Some("Herbert, Frank;Herbert, Brian".into()),
+                extension: Some("epub".into()),
+            },
+            crate::history::Entry {
+                at: 0,
+                md5: "0".repeat(32),
+                path: std::path::PathBuf::from("/definitely/not/here/b.pdf"),
+                size: 0,
+                verified: false,
+                title: String::new(),
+                authors: None,
+                extension: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_history_table_lines_up() {
+        let rendered = render_history(&history_entries(), &Style::plain());
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 4, "header, rule, two rows");
+        assert!(lines[2].contains("Saga Dune"));
+        assert!(lines[2].contains("2h ago"), "{:?}", lines[2]);
+        // Only the first of several authors fits.
+        assert!(lines[2].contains("Herbert, Frank") && !lines[2].contains("Brian"));
+
+        let width = terminal_width();
+        for line in &lines {
+            assert!(display_width(line) <= width, "{line:?}");
+        }
+    }
+
+    /// The mark for a file that has gone missing has to survive truncation —
+    /// the row that most needs it is the one with the longest title.
+    #[test]
+    fn a_missing_file_is_marked_even_with_a_long_title() {
+        let rendered = render_history(&history_entries(), &Style::plain());
+        for line in rendered.lines().skip(2) {
+            assert!(
+                line.split_whitespace().nth(1) == Some("!"),
+                "no missing mark on: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_with_nothing_in_it_still_renders() {
+        let rendered = render_history(&history_entries()[1..], &Style::plain());
+        assert!(!rendered.contains("None"));
+        assert_eq!(rendered.lines().count(), 3);
+    }
+
+    #[test]
+    fn history_json_carries_both_forms_of_the_time() {
+        let json = json_history(&history_entries());
+        assert!(json.contains("\"downloaded_at\": "));
+        assert!(json.contains("\"downloaded_at_utc\": \""));
+        assert!(json.contains("\"present\": false"));
+        assert!(json.contains("\"verified\": true"));
+        // Absent optional fields are omitted rather than nulled.
+        assert!(!json.contains("\"authors\": \"\""));
+        assert_eq!(json_history(&[]).trim(), "[\n]");
     }
 
     #[test]
