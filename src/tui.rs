@@ -858,9 +858,7 @@ impl App {
 
         // `author:herbert dune ext:epub` — the box is the only input this
         // interface has, so the tags do the work the CLI's flags do.
-        let mut query = SearchQuery::new(String::new());
-        query.limit = 100;
-        query::apply(&terms, &mut query);
+        let query = self.search_query(&terms);
         if query.terms.trim().is_empty() {
             self.error = Some("that is all filters and no search terms".into());
             return;
@@ -891,6 +889,16 @@ impl App {
                 result: payload,
             });
         });
+    }
+
+    /// Build a TUI search from the defaults captured at startup, then let
+    /// inline tags add the same refinements they do for CLI searches.
+    fn search_query(&self, terms: &str) -> SearchQuery {
+        let mut query = SearchQuery::new(String::new());
+        query.limit = self.settings.search_limit;
+        query.topics = self.settings.search_topics.clone();
+        query::apply(terms, &mut query);
+        query
     }
 
     /// Download every marked record, or the highlighted one when none are.
@@ -2430,23 +2438,34 @@ impl App {
         match field {
             Field::Covers => {
                 let on = self.config.covers.unwrap_or(true);
-                self.settings.covers = on;
-                if !on {
+                if !self.settings.overrides.covers {
+                    self.settings.covers = on;
+                }
+                if !self.settings.covers {
                     self.erase_cover();
                     self.covers.clear();
                     self.cover_due = None;
+                } else if self.protocol == Protocol::None {
+                    self.protocol = graphics::detect();
                 }
             }
             Field::History => self.settings.history = self.config.history.unwrap_or(true),
-            Field::Verify => self.settings.verify = self.config.verify.unwrap_or(true),
-            Field::Reader => self.settings.reader = self.config.reader.clone(),
-            Field::MaxSize => {
-                self.settings.max_bytes = self.config.max_size.unwrap_or(self.settings.max_bytes);
+            Field::Verify if !self.settings.overrides.verify => {
+                self.settings.verify = self.config.verify.unwrap_or(true);
             }
-            Field::DownloadDir => {
-                if let Some(dir) = self.config.download_dir.clone() {
-                    self.settings.dest_dir = dir;
-                }
+            Field::Reader if !self.settings.overrides.reader => {
+                self.settings.reader = self.config.reader.clone();
+            }
+            Field::MaxSize if !self.settings.overrides.max_bytes => {
+                self.settings.max_bytes =
+                    self.config.max_size.unwrap_or(crate::DEFAULT_MAX_BYTES);
+            }
+            Field::DownloadDir if !self.settings.overrides.dest_dir => {
+                self.settings.dest_dir = self
+                    .config
+                    .download_dir
+                    .clone()
+                    .unwrap_or_else(crate::config::default_download_dir);
             }
             // Deferred: only takes effect next launch.
             _ => {}
@@ -4011,9 +4030,13 @@ impl App {
 
         let editing_line = self.form.editing.is_some();
         let mut lines: Vec<Line> = vec![Line::from("")];
+        let mut active_line = 0usize;
 
         for (i, &field) in Field::ALL.iter().enumerate() {
             let selected = i == self.form.selected;
+            if selected {
+                active_line = lines.len();
+            }
             let marker = if selected { " ▸ " } else { "   " };
             let label_style = if selected {
                 theme::text().add_modifier(Modifier::BOLD)
@@ -4043,6 +4066,9 @@ impl App {
             if selected && self.form.sub == SubFocus::Topics && field == Field::Topics {
                 let chosen = self.topics_effective();
                 for (ti, &topic) in Topic::ALL.iter().enumerate() {
+                    if ti == self.form.topic_row {
+                        active_line = lines.len();
+                    }
                     let cursor = if ti == self.form.topic_row { " ▸ " } else { "   " };
                     let mark = if chosen.contains(&topic) { "[x] " } else { "[ ] " };
                     let style = if ti == self.form.topic_row {
@@ -4064,6 +4090,9 @@ impl App {
                     )));
                 }
                 for (mi, mirror) in self.config.mirrors.iter().enumerate() {
+                    if mi == self.form.mirror_row {
+                        active_line = lines.len();
+                    }
                     let cursor = if mi == self.form.mirror_row { " ▸ " } else { "   " };
                     let style = if mi == self.form.mirror_row {
                         theme::text()
@@ -4076,6 +4105,7 @@ impl App {
                     )));
                 }
                 if editing_line {
+                    active_line = lines.len();
                     let mut spans = vec![Span::styled("        ", theme::faint())];
                     spans.extend(self.edit_spans());
                     lines.push(Line::from(spans));
@@ -4083,7 +4113,12 @@ impl App {
             }
         }
 
-        frame.render_widget(Paragraph::new(lines), inner);
+        let viewport = usize::from(inner.height);
+        let scroll = active_line
+            .saturating_add(1)
+            .saturating_sub(viewport)
+            .min(usize::from(u16::MAX)) as u16;
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 
         // The current field's help, or the last validation error in its place.
         let field = self.current_field();
@@ -4603,6 +4638,9 @@ mod tests {
                 reader: None,
                 history: false,
                 covers: false,
+                search_limit: 25,
+                search_topics: vec![Topic::Libgen, Topic::Fiction],
+                overrides: Default::default(),
             },
             config: Config::default(),
             form: SettingsForm::default(),
@@ -5038,6 +5076,18 @@ mod tests {
         a.spawn_search();
         assert!(a.error.is_some());
         assert!(!a.pending_search);
+    }
+
+    #[test]
+    fn tui_searches_use_the_startup_config_defaults() {
+        let mut a = app();
+        a.settings.search_limit = 50;
+        a.settings.search_topics = vec![Topic::Comics, Topic::Magazines];
+
+        let query = a.search_query("dune");
+
+        assert_eq!(query.limit, 50);
+        assert_eq!(query.topics, [Topic::Comics, Topic::Magazines]);
     }
 
     #[test]
@@ -5644,6 +5694,82 @@ mod tests {
     }
 
     #[test]
+    fn clearing_live_fields_restores_built_in_defaults() {
+        let mut a = app();
+        a.config.max_size = Some(2 * 1024 * 1024 * 1024);
+        a.settings.max_bytes = 2 * 1024 * 1024 * 1024;
+        a.config.download_dir = Some(PathBuf::from("/old/downloads"));
+        a.settings.dest_dir = PathBuf::from("/old/downloads");
+        open_settings(&mut a);
+
+        go_to(&mut a, Field::MaxSize);
+        press(&mut a, KeyCode::Enter);
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.config.max_size, None);
+        assert_eq!(a.settings.max_bytes, crate::DEFAULT_MAX_BYTES);
+
+        go_to(&mut a, Field::DownloadDir);
+        press(&mut a, KeyCode::Enter);
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.config.download_dir, None);
+        assert_eq!(a.settings.dest_dir, crate::config::default_download_dir());
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn live_config_edits_do_not_override_cli_values() {
+        let mut a = app();
+        a.settings.dest_dir = PathBuf::from("/cli/downloads");
+        a.settings.max_bytes = 123;
+        a.settings.verify = false;
+        a.settings.reader = Some("cli-reader".into());
+        a.settings.covers = false;
+        a.settings.overrides = crate::SettingsOverrides {
+            dest_dir: true,
+            max_bytes: true,
+            verify: true,
+            reader: true,
+            covers: true,
+        };
+
+        a.config.download_dir = Some(PathBuf::from("/config/downloads"));
+        a.config.max_size = Some(456);
+        a.config.verify = Some(true);
+        a.config.reader = Some("config-reader".into());
+        a.config.covers = Some(true);
+        for field in [
+            Field::DownloadDir,
+            Field::MaxSize,
+            Field::Verify,
+            Field::Reader,
+            Field::Covers,
+        ] {
+            a.apply_live(field);
+        }
+
+        assert_eq!(a.settings.dest_dir, PathBuf::from("/cli/downloads"));
+        assert_eq!(a.settings.max_bytes, 123);
+        assert!(!a.settings.verify);
+        assert_eq!(a.settings.reader.as_deref(), Some("cli-reader"));
+        assert!(!a.settings.covers);
+    }
+
+    #[test]
+    fn enabling_covers_live_initializes_the_graphics_protocol() {
+        let mut a = app();
+        a.config.covers = Some(true);
+        a.settings.covers = false;
+        a.protocol = Protocol::None;
+
+        a.apply_live(Field::Covers);
+
+        assert!(a.settings.covers);
+        assert_eq!(a.protocol, graphics::detect());
+    }
+
+    #[test]
     fn collections_can_be_toggled_in_a_sub_list() {
         let mut a = app();
         open_settings(&mut a);
@@ -5706,6 +5832,43 @@ mod tests {
         assert!(screen.contains("cover art"), "a field label shows");
         assert!(screen.contains("[x] libgen"), "the collections sub-list expands");
         assert!(screen.contains("applies next launch"), "deferred fields say so");
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn the_settings_form_scrolls_to_keep_the_selection_visible() {
+        let mut a = app();
+        open_settings(&mut a);
+        go_to(&mut a, Field::AllowHttp);
+
+        let screen = draw(&mut a, 80, 12);
+
+        assert!(
+            screen.contains("allow http"),
+            "selected row was clipped:\n{screen}"
+        );
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn the_settings_form_scrolls_within_a_long_mirror_list() {
+        let mut a = app();
+        a.config.mirrors = (0..12)
+            .map(|i| format!("https://mirror-{i}.example"))
+            .collect();
+        open_settings(&mut a);
+        go_to(&mut a, Field::Mirrors);
+        press(&mut a, KeyCode::Enter);
+        for _ in 0..11 {
+            press(&mut a, KeyCode::Down);
+        }
+
+        let screen = draw(&mut a, 80, 12);
+
+        assert!(
+            screen.contains("https://mirror-11.example"),
+            "active mirror was clipped:\n{screen}"
+        );
         let _ = std::fs::remove_file(&a.config_path);
     }
 

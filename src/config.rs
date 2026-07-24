@@ -30,6 +30,10 @@ pub struct Config {
     pub history: Option<bool>,
     /// Set to false to never fetch or draw cover art.
     pub covers: Option<bool>,
+    /// Active entries this version does not understand. Keeping their original
+    /// lines lets an older binary edit known settings without erasing options
+    /// written by a newer one.
+    unknown: Vec<String>,
 }
 
 impl Config {
@@ -48,6 +52,14 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let mut cfg = Config::default();
         let entries = parse_pairs(text)?;
+        cfg.unknown = text
+            .lines()
+            .filter_map(|raw| {
+                let active = raw.split('#').next().unwrap_or("").trim();
+                let (key, _) = active.split_once('=')?;
+                (!is_known_key(key.trim())).then(|| raw.to_string())
+            })
+            .collect();
 
         for (key, values) in &entries {
             let last = values.last().map(String::as_str).unwrap_or_default();
@@ -196,6 +208,13 @@ impl Config {
             self.allow_http.then(|| "true".to_string()),
             "false",
         );
+        if !self.unknown.is_empty() {
+            out.push_str("\n# Options preserved for compatibility with newer versions.\n");
+            for entry in &self.unknown {
+                out.push_str(entry);
+                out.push('\n');
+            }
+        }
         out
     }
 
@@ -214,6 +233,25 @@ impl Config {
         std::fs::write(path, self.render())
             .with_context(|| format!("could not write {}", path.display()))
     }
+}
+
+fn is_known_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "mirror"
+            | "mirrors"
+            | "download_dir"
+            | "limit"
+            | "topics"
+            | "allow_http"
+            | "verify"
+            | "reader"
+            | "viewer"
+            | "history"
+            | "covers"
+            | "cover_art"
+            | "max_size"
+    )
 }
 
 /// Emit one config entry: its comment block, then either the active
@@ -444,6 +482,29 @@ mod tests {
     fn unknown_keys_are_ignored_not_fatal() {
         let cfg = Config::parse("future_option = 3\nlimit = 10").unwrap();
         assert_eq!(cfg.limit, Some(10));
+    }
+
+    #[test]
+    fn unknown_keys_survive_rendering_and_saving() {
+        let mut cfg =
+            Config::parse("future_option = 3 # keep this\nlimit = 10\nfuture_list = a, b\n")
+                .unwrap();
+        cfg.limit = Some(20);
+
+        let rendered = cfg.render();
+        assert!(rendered.contains("future_option = 3 # keep this"));
+        assert!(rendered.contains("future_list = a, b"));
+
+        let path = std::env::temp_dir().join(format!(
+            "tomesole-config-preserve-{}-{:?}.conf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cfg.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("future_option = 3 # keep this"));
+        assert!(saved.contains("limit = 20"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -46,7 +46,7 @@ use crate::net::{Http, NetPolicy};
 use crate::term::{Spinner, Style};
 
 /// Default ceiling on a single download.
-const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -125,6 +125,22 @@ pub struct Settings {
     pub history: bool,
     /// Fetch and draw cover art.
     pub covers: bool,
+    /// Search defaults captured when the process starts. Settings-tab edits to
+    /// these values deliberately take effect on the next launch.
+    pub search_limit: usize,
+    pub search_topics: Vec<crate::model::Topic>,
+    /// Which effective values came from command-line flags and must therefore
+    /// not be displaced by live config-file edits.
+    pub overrides: SettingsOverrides,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SettingsOverrides {
+    pub dest_dir: bool,
+    pub max_bytes: bool,
+    pub verify: bool,
+    pub reader: bool,
+    pub covers: bool,
 }
 
 pub fn settings(global: &Global, config: &Config) -> Settings {
@@ -165,6 +181,18 @@ pub fn settings(global: &Global, config: &Config) -> Settings {
         reader: global.reader.clone().or_else(|| config.reader.clone()),
         history: config.history.unwrap_or(true),
         covers: !global.no_covers && config.covers.unwrap_or(true),
+        search_limit: config.limit.unwrap_or(25),
+        search_topics: config
+            .topics
+            .clone()
+            .unwrap_or_else(|| vec![crate::model::Topic::Libgen, crate::model::Topic::Fiction]),
+        overrides: SettingsOverrides {
+            dest_dir: global.dest_dir.is_some(),
+            max_bytes: global.max_size.is_some(),
+            verify: global.verify.is_some(),
+            reader: global.reader.is_some(),
+            covers: global.no_covers,
+        },
     }
 }
 
