@@ -1,0 +1,27 @@
+[package]
+name = "clibgen"
+version = "0.1.0"
+edition = "2024"
+description = "A clean, safe CLI for searching and downloading from Library Genesis"
+license = "MIT"
+readme = "README.md"
+
+# Kept deliberately small. Only three things here are genuinely not worth
+# hand-rolling: TLS (ureq/rustls), and the OS extended-attribute call used to
+# mark downloads as quarantined on macOS. URL parsing comes from ureq's own
+# re-exported `http` crate, so the SSRF guard validates with exactly the same
+# parser that opens the connection.
+[dependencies]
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+ureq = "3.3.0"
+
+[target."cfg(unix)".dependencies]
+xattr = "1.6.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
