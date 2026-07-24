@@ -19,6 +19,9 @@ ureq = "3.3.0"
 [target."cfg(unix)".dependencies]
 xattr = "1.6.1"
 
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

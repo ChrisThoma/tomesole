@@ -346,29 +346,6 @@ fn cmd_get(md5: &str, cli: &Cli, config: &Config, style: &Style) -> Result<i32> 
         Some(Spinner::start("looking up the file", *style))
     };
 
-    let (resolved, used) = pool.try_each(
-        |base| net::with_retry(2, |_| libgen::resolve_download(&http, base, md5)),
-        |base, _| {
-            if let Some(s) = &spinner {
-                let host = net::host_of(base).unwrap_or_default();
-                s.update(&format!("{host} failed, trying another mirror"), *style);
-            }
-        },
-    )?;
-    if let Some(s) = spinner {
-        s.clear();
-    }
-
-    if !settings.quiet {
-        eprintln!(
-            "\n  {} {}\n",
-            style.bold(&resolved.book.title),
-            style.dim(&format!("via {}", net::host_of(&used).unwrap_or_default())),
-        );
-    }
-
-    // The link is already resolved, so stream straight from it rather than
-    // asking the pool to resolve again — the key it carries is single-use.
     let opts = download::Options {
         dest_dir: settings.dest_dir.clone(),
         filename: settings.output.clone(),
@@ -377,19 +354,48 @@ fn cmd_get(md5: &str, cli: &Cli, config: &Config, style: &Style) -> Result<i32> 
         force: settings.force,
         resume: settings.resume,
     };
-    let mut bar = term::Progress::new("downloading", resolved.book.size_bytes, *style);
-    let result = download::fetch(
-        &http,
-        &resolved.url,
-        &resolved.book,
-        &opts,
-        &mut |done, total| bar.set(done, total),
+
+    // Resolve and transfer as one mirror attempt. Download URLs may be
+    // single-use, so every retry obtains a fresh one from that mirror, and a
+    // transfer failure advances through the pool just like result downloads.
+    let result = pool.try_each(
+        |base| {
+            net::with_retry(2, |_| {
+                let resolved = libgen::resolve_download(&http, base, md5)?;
+                let mut bar = term::Progress::new("downloading", resolved.book.size_bytes, *style);
+                let outcome = download::fetch(
+                    &http,
+                    &resolved.url,
+                    &resolved.book,
+                    &opts,
+                    &mut |done, total| bar.set(done, total),
+                );
+                bar.clear();
+                outcome.map(|outcome| (outcome, resolved.book))
+            })
+        },
+        |base, _| {
+            if let Some(s) = &spinner {
+                let host = net::host_of(base).unwrap_or_default();
+                s.update(&format!("{host} failed, trying another mirror"), *style);
+            }
+        },
     );
-    bar.clear();
+    if let Some(s) = spinner {
+        s.clear();
+    }
+
     match result {
-        Ok(outcome) => {
-            history::record(settings.history, &resolved.book, &outcome);
-            report(&outcome, &resolved.book, &settings, style);
+        Ok(((outcome, book), used)) => {
+            if !settings.quiet {
+                eprintln!(
+                    "\n  {} {}\n",
+                    style.bold(&book.title),
+                    style.dim(&format!("via {}", net::host_of(&used).unwrap_or_default())),
+                );
+            }
+            history::record(settings.history, &book, &outcome);
+            report(&outcome, &book, &settings, style);
             Ok(0)
         }
         Err(e) => {

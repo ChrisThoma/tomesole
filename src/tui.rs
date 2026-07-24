@@ -11,10 +11,12 @@
 //! makes the progress display much easier to read.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::{ExecutableCommand, terminal::SetTitle};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
@@ -124,8 +126,11 @@ enum Ev {
     Redraw,
     /// Mirror selection finished; carries the ranked pool or a failure.
     Mirrors(std::result::Result<Vec<Uri>, String>),
-    /// A search finished; carries the results and the mirror that served them.
-    Results(std::result::Result<(Vec<Book>, String), String>),
+    /// A search finished; the generation lets the UI discard stale workers.
+    Results {
+        generation: u64,
+        result: std::result::Result<(Vec<Book>, String), String>,
+    },
     Progress {
         md5: String,
         done: u64,
@@ -442,6 +447,8 @@ pub struct App {
     downloading: bool,
     /// A search typed before the mirror pool was ready, run once it is.
     pending_search: bool,
+    /// Monotonically identifies the newest search worker.
+    search_generation: u64,
     quit: bool,
     tx: Sender<Ev>,
 
@@ -471,6 +478,43 @@ pub struct App {
     /// spinner shown while something is in flight. The event loop wakes on a
     /// 250 ms timer even when idle, so it turns at a calm few frames a second.
     spinner: usize,
+}
+
+const PUSH_TERMINAL_TITLE: &[u8] = b"\x1b[22;0t";
+const POP_TERMINAL_TITLE: &[u8] = b"\x1b[23;0t";
+
+struct TerminalTitle {
+    active: bool,
+}
+
+impl TerminalTitle {
+    fn set(title: &str) -> Self {
+        let mut stdout = io::stdout();
+        let active = push_and_set_title(&mut stdout, title).is_ok();
+        Self { active }
+    }
+}
+
+impl Drop for TerminalTitle {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = restore_title(&mut io::stdout());
+        }
+    }
+}
+
+fn push_and_set_title(out: &mut impl Write, title: &str) -> io::Result<()> {
+    out.write_all(PUSH_TERMINAL_TITLE)?;
+    if let Err(error) = out.execute(SetTitle(title)) {
+        let _ = restore_title(out);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn restore_title(out: &mut impl Write) -> io::Result<()> {
+    out.write_all(POP_TERMINAL_TITLE)?;
+    out.flush()
 }
 
 /// Run the interface until the user quits.
@@ -539,6 +583,7 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
         busy: true,
         downloading: false,
         pending_search: false,
+        search_generation: 0,
         quit: false,
         tx,
         library: Vec::new(),
@@ -560,12 +605,9 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
     app.spawn_mirror_resolve(app.settings.refresh_mirrors);
 
     let mut terminal = ratatui::try_init()?;
-    // Name the window after us while the interface is up. A full-screen app
-    // never overwrites the title the shell last set — usually the launch
-    // command — so without this it just hangs there stale. We deliberately do
-    // not save and restore the prior title: the shell resets it at the next
-    // prompt, and that prior title is the very stale text we are replacing.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("tomesole"));
+    // Keep the app's title scoped to the full-screen session. The guard also
+    // restores it when the event loop or terminal teardown returns an error.
+    let _title = TerminalTitle::set("tomesole");
     let outcome = app.event_loop(&mut terminal, &rx);
     app.erase_cover();
     ratatui::try_restore()?;
@@ -651,6 +693,8 @@ impl App {
         self.busy = true;
         self.error = None;
         self.status = format!("searching for “{}”", query.terms);
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
 
         let tx = self.tx.clone();
         let settings = self.settings.clone();
@@ -666,7 +710,10 @@ impl App {
                         .map(|(books, used)| (books, net::host_of(&used).unwrap_or_default()))
                 })
                 .map_err(|e| e.to_string());
-            let _ = tx.send(Ev::Results(payload));
+            let _ = tx.send(Ev::Results {
+                generation,
+                result: payload,
+            });
         });
     }
 
@@ -1512,7 +1559,11 @@ impl App {
                 self.status = "no mirror available".into();
                 self.error = Some(first_line(&e));
             }
-            Ev::Results(Ok((books, host))) => {
+            Ev::Results { generation, .. } if generation != self.search_generation => {}
+            Ev::Results {
+                result: Ok((books, host)),
+                ..
+            } => {
                 self.busy = false;
                 self.mirror_label = host;
                 self.marked = vec![false; books.len()];
@@ -1532,7 +1583,7 @@ impl App {
                 };
                 self.mode = Mode::Browsing;
             }
-            Ev::Results(Err(e)) => {
+            Ev::Results { result: Err(e), .. } => {
                 self.busy = false;
                 self.status = "search failed".into();
                 self.error = Some(first_line(&e));
@@ -3782,6 +3833,7 @@ mod tests {
             busy: false,
             downloading: false,
             pending_search: false,
+            search_generation: 0,
             quit: false,
             tx,
             library: Vec::new(),
@@ -4190,7 +4242,10 @@ mod tests {
     fn results_reset_selection_and_marks() {
         let mut a = app();
         a.marked = vec![true, true];
-        a.handle(Ev::Results(Ok((books(2), "libgen.li".into()))));
+        a.handle(Ev::Results {
+            generation: 0,
+            result: Ok((books(2), "libgen.li".into())),
+        });
         assert_eq!(a.marked, [false, false]);
         assert_eq!(a.table.selected(), Some(0));
         assert_eq!(a.mirror_label, "libgen.li");
@@ -4200,9 +4255,29 @@ mod tests {
     #[test]
     fn empty_results_leave_nothing_selected() {
         let mut a = app();
-        a.handle(Ev::Results(Ok((Vec::new(), "libgen.li".into()))));
+        a.handle(Ev::Results {
+            generation: 0,
+            result: Ok((Vec::new(), "libgen.li".into())),
+        });
         assert_eq!(a.table.selected(), None);
         assert!(a.status.contains("nothing found"));
+    }
+
+    #[test]
+    fn a_superseded_search_cannot_replace_newer_results() {
+        let mut a = app();
+        a.search_generation = 2;
+        a.busy = true;
+        install(&mut a, books(1));
+
+        a.handle(Ev::Results {
+            generation: 1,
+            result: Ok((books(3), "old.example".into())),
+        });
+
+        assert_eq!(a.results.len(), 1);
+        assert!(a.busy, "the current search is still running");
+        assert_ne!(a.mirror_label, "old.example");
     }
 
     #[test]
@@ -4996,7 +5071,10 @@ mod tests {
         pick(&mut a, 'l', "english");
         assert_eq!(a.lang_filter.as_deref(), Some("English"));
 
-        a.handle(Ev::Results(Ok((polyglot(), "libgen.li".into()))));
+        a.handle(Ev::Results {
+            generation: 0,
+            result: Ok((polyglot(), "libgen.li".into())),
+        });
         assert_eq!(a.lang_filter.as_deref(), Some("English"), "a standing preference");
         assert_eq!(a.visible.len(), 2);
         assert!(a.status.contains("2 of 6"), "{}", a.status);
@@ -5351,5 +5429,14 @@ mod tests {
             })),
             " 25%"
         );
+    }
+
+    #[test]
+    fn terminal_title_is_pushed_set_and_restored() {
+        let mut output = Vec::new();
+        push_and_set_title(&mut output, "tomesole").unwrap();
+        restore_title(&mut output).unwrap();
+
+        assert_eq!(output, b"\x1b[22;0t\x1b]0;tomesole\x07\x1b[23;0t");
     }
 }

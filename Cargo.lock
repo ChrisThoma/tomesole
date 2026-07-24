@@ -1575,6 +1575,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "ureq",
+ "windows-sys 0.61.2",
  "xattr",
 ]
 

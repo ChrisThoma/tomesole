@@ -221,6 +221,7 @@ pub struct Fetched {
     pub content_type: Option<String>,
     pub content_length: Option<u64>,
     pub content_disposition: Option<String>,
+    pub content_range: Option<String>,
 }
 
 impl Http {
@@ -243,7 +244,16 @@ impl Http {
     ///
     /// `range` optionally requests a byte range, used to resume downloads.
     pub fn get(&self, uri: &Uri, range: Option<u64>) -> Result<Fetched> {
-        self.request(uri, range, None)
+        self.request(uri, range, None, true)
+    }
+
+    /// Issue a GET whose body will be streamed to disk.
+    ///
+    /// The ordinary request deadline is deliberately limited to small page
+    /// requests. A healthy large transfer may take much longer, so downloads
+    /// retain the connect bound but have no whole-body deadline.
+    pub fn get_download(&self, uri: &Uri, range: Option<u64>) -> Result<Fetched> {
+        self.request(uri, range, None, false)
     }
 
     /// A GET that says which page it came from.
@@ -255,22 +265,38 @@ impl Http {
     /// The header is only sent to the host it names, so a redirect elsewhere
     /// cannot be used to learn which record was being looked at.
     pub fn get_referred(&self, uri: &Uri, referer: &Uri) -> Result<Fetched> {
-        self.request(uri, None, Some(referer))
+        self.request(uri, None, Some(referer), true)
     }
 
-    fn request(&self, uri: &Uri, range: Option<u64>, referer: Option<&Uri>) -> Result<Fetched> {
+    fn request(
+        &self,
+        uri: &Uri,
+        range: Option<u64>,
+        referer: Option<&Uri>,
+        bounded_body: bool,
+    ) -> Result<Fetched> {
         let mut current = uri.clone();
         let mut hops = 0usize;
 
         loop {
             check_uri_resolves_publicly(&current, &self.policy)?;
 
-            let mut req = self
-                .agent
-                .get(current.to_string())
-                .config()
-                .timeout_global(Some(self.policy.request_timeout))
-                .build();
+            let config = self.agent.get(current.to_string()).config();
+            let mut req = if bounded_body {
+                config
+                    .timeout_global(Some(self.policy.request_timeout))
+                    .build()
+            } else {
+                config
+                    .timeout_global(None)
+                    // In ureq the response timeout remains an ancestor of the
+                    // body-read timer, so setting it would still cap the whole
+                    // transfer. Connection establishment remains bounded by
+                    // the agent policy.
+                    .timeout_recv_response(None)
+                    .timeout_recv_body(None)
+                    .build()
+            };
 
             if let Some(from) = range {
                 req = req.header("Range", format!("bytes={from}-"));
@@ -322,6 +348,7 @@ impl Http {
             let headers = resp.headers();
             let content_type = header_string(headers, "content-type");
             let content_disposition = header_string(headers, "content-disposition");
+            let content_range = header_string(headers, "content-range");
             let body = resp.into_body();
             let content_length = body.content_length();
 
@@ -331,6 +358,7 @@ impl Http {
                 content_type,
                 content_length,
                 content_disposition,
+                content_range,
             });
         }
     }

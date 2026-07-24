@@ -158,10 +158,12 @@ fn record_to(path: &Path, book: &Book, outcome: &Outcome) {
     // downloaded before any of this existed has no entry at all, and asking for
     // it again is a reasonable way to say "this one is mine": record it, so the
     // library can hold books that predate the library.
-    if outcome.skipped && load_from(path).iter().any(|e| e.path == outcome.path) {
-        return;
-    }
-    let _ = append_to(path, &Entry::of(book, outcome));
+    let _ = with_lock(path, || {
+        if outcome.skipped && load_from(path).iter().any(|e| e.path == outcome.path) {
+            return Ok(());
+        }
+        append_unlocked(path, &Entry::of(book, outcome))
+    });
 }
 
 /// Every remembered download, newest first.
@@ -184,7 +186,12 @@ pub fn load_from(path: &Path) -> Vec<Entry> {
 }
 
 /// Add an entry, replacing any earlier one for the same file.
+#[cfg(test)]
 pub fn append_to(path: &Path, entry: &Entry) -> Result<()> {
+    with_lock(path, || append_unlocked(path, entry))
+}
+
+fn append_unlocked(path: &Path, entry: &Entry) -> Result<()> {
     if let Some(parent) = path.parent() {
         crate::config::ensure_dir(parent)?;
     }
@@ -201,14 +208,16 @@ pub fn append_to(path: &Path, entry: &Entry) -> Result<()> {
 
 /// Forget a single entry.
 pub fn remove_from(path: &Path, target: &Path) -> Result<bool> {
-    let mut entries: Vec<Entry> = load_from(path).into_iter().rev().collect();
-    let before = entries.len();
-    entries.retain(|e| e.path != target);
-    if entries.len() == before {
-        return Ok(false);
-    }
-    write_all(path, &entries)?;
-    Ok(true)
+    with_lock(path, || {
+        let mut entries: Vec<Entry> = load_from(path).into_iter().rev().collect();
+        let before = entries.len();
+        entries.retain(|e| e.path != target);
+        if entries.len() == before {
+            return Ok(false);
+        }
+        write_all(path, &entries)?;
+        Ok(true)
+    })
 }
 
 pub fn remove(target: &Path) -> Result<bool> {
@@ -218,11 +227,29 @@ pub fn remove(target: &Path) -> Result<bool> {
 /// Forget everything.
 pub fn clear() -> Result<()> {
     let path = crate::config::history_path();
-    match std::fs::remove_file(&path) {
+    with_lock(&path, || match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("could not remove {}", path.display())),
+    })
+}
+
+/// Hold a sibling advisory lock across every read/merge/write mutation.
+fn with_lock<T>(path: &Path, op: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some(parent) = path.parent() {
+        crate::config::ensure_dir(parent)?;
     }
+    let lock_path = path.with_extension("tsv.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("could not open history lock {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("could not lock {}", lock_path.display()))?;
+    op()
 }
 
 /// Replace the file, oldest entry first.
@@ -497,6 +524,34 @@ mod tests {
         let loaded = load_from(&path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].size, 4096);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_updates_are_merged_without_loss() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("history.tsv");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(17));
+        let mut workers = Vec::new();
+        for i in 0..16 {
+            let path = path.clone();
+            let start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut item = entry(&format!("Book {i}"));
+                item.path = PathBuf::from(format!("/books/{i}.epub"));
+                start.wait();
+                append_to(&path, &item).unwrap();
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let loaded = load_from(&path);
+        assert_eq!(loaded.len(), 16);
+        let paths: std::collections::HashSet<_> = loaded.iter().map(|e| &e.path).collect();
+        assert_eq!(paths.len(), 16);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

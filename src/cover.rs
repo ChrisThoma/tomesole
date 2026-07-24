@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use ureq::http::Uri;
 
-use crate::error::Result;
+use crate::error::{Context, Result};
 use crate::graphics::Image;
 use crate::model::Book;
 use crate::net::{Http, join_uri};
@@ -192,7 +192,7 @@ fn download(http: &Http, url: &Uri, from: &Uri) -> Result<Option<Cover>> {
         .into_with_config()
         .limit(MAX_COVER_BYTES)
         .read_to_vec()
-        .unwrap_or_default();
+        .with_context(|| format!("could not read cover response body from {url}"))?;
 
     Ok(Cover::classify(bytes))
 }
@@ -293,6 +293,8 @@ pub fn same_host(base: &Uri, image: &Uri) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
 
     const PAGE: &str = r#"
         <html><body>
@@ -373,6 +375,41 @@ mod tests {
         let cover = Cover::classify(b"\x89PNG\r\n\x1a\nnot really".to_vec()).unwrap();
         assert_eq!(cover.extension(), "png");
         assert!(cover.pixels().is_none());
+    }
+
+    #[test]
+    fn an_interrupted_cover_body_is_an_error_not_a_missing_cover() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\
+                      Content-Length: 100\r\nConnection: close\r\n\r\n\xff\xd8\xff",
+                )
+                .unwrap();
+        });
+
+        let http = Http::new(crate::net::NetPolicy {
+            allow_http: true,
+            allow_private_hosts: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let url: Uri = format!("http://127.0.0.1:{port}/cover.jpg")
+            .parse()
+            .unwrap();
+        let from: Uri = format!("http://127.0.0.1:{port}/record").parse().unwrap();
+        assert!(download(&http, &url, &from).is_err());
     }
 
     /// End to end against a live mirror.

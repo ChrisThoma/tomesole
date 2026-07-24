@@ -291,7 +291,7 @@ pub fn fetch(
         _ => 0,
     };
 
-    let response = http.get(
+    let response = http.get_download(
         url,
         if resume_from > 0 {
             Some(resume_from)
@@ -304,7 +304,23 @@ pub fn fetch(
     }
 
     // A 200 in reply to a ranged request means the server ignored the range.
-    let resuming = resume_from > 0 && response.status == 206;
+    // A 206 is only safe to append when it begins exactly where our partial
+    // file ends; accepting any other offset would splice unrelated bytes.
+    let resuming = if resume_from > 0 && response.status == 206 {
+        let start = response
+            .content_range
+            .as_deref()
+            .and_then(content_range_start)
+            .ok_or_else(|| err!("mirror returned an invalid Content-Range for a resumed file"))?;
+        if start != resume_from {
+            bail!(
+                "mirror resumed at byte {start}, but the partial file ends at byte {resume_from}"
+            );
+        }
+        true
+    } else {
+        false
+    };
 
     // For an MD5-only download the catalogue never told us the format, so fall
     // back to the server's filename hint — but only to read an extension off
@@ -425,13 +441,14 @@ pub fn fetch(
         );
     }
 
-    std::fs::rename(&part_path, &final_path).with_context(|| {
-        format!(
-            "could not move {} into place at {}",
-            part_path.display(),
-            final_path.display()
-        )
-    })?;
+    if !install(&part_path, &final_path, opts.force)? {
+        return Ok(Outcome {
+            path: final_path,
+            bytes: 0,
+            verified: false,
+            skipped: true,
+        });
+    }
 
     mark_quarantined(&final_path);
 
@@ -441,6 +458,92 @@ pub fn fetch(
         verified: verified && opts.verify,
         skipped: false,
     })
+}
+
+/// Parse the first byte offset from `Content-Range: bytes START-END/TOTAL`.
+fn content_range_start(value: &str) -> Option<u64> {
+    let (unit, range) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (bounds, _) = range.split_once('/')?;
+    let (start, end) = bounds.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    (start <= end).then_some(start)
+}
+
+/// Move a verified partial into place with the requested replacement policy.
+fn install(part: &Path, final_path: &Path, force: bool) -> Result<bool> {
+    if !force {
+        // Creating the second name is atomic and fails if it already exists.
+        // Both paths are siblings, so the hard link is on the same filesystem.
+        match std::fs::hard_link(part, final_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(part);
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not install {} at {} without replacing an existing file",
+                        part.display(),
+                        final_path.display()
+                    )
+                });
+            }
+        }
+        std::fs::remove_file(part)
+            .with_context(|| format!("could not remove {}", part.display()))?;
+        return Ok(true);
+    }
+
+    replace(part, final_path).with_context(|| {
+        format!(
+            "could not replace {} with {}",
+            final_path.display(),
+            part.display()
+        )
+    })?;
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn replace(part: &Path, final_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(part, final_path)
+}
+
+#[cfg(windows)]
+fn replace(part: &Path, final_path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(part, final_path) {
+        Ok(()) => return Ok(()),
+        Err(rename_error) if !final_path.exists() => return Err(rename_error),
+        Err(_) => {}
+    }
+
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let replaced: Vec<u16> = final_path.as_os_str().encode_wide().chain([0]).collect();
+    let replacement: Vec<u16> = part.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: both strings are NUL-terminated and live for the duration of the
+    // call. No backup or metadata-exclusion buffers are supplied.
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Read a usable extension out of a `Content-Disposition` header.
@@ -732,6 +835,7 @@ mod tests {
 
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+    use std::time::Duration;
 
     /// Serve one canned response on a loopback port, then exit.
     fn serve_once(content_type: &str, body: Vec<u8>) -> u16 {
@@ -886,5 +990,129 @@ mod tests {
         assert!(guard_content_type(None, "epub").is_ok());
         // An actual HTML record is allowed to be HTML.
         assert!(guard_content_type(Some("text/html"), "html").is_ok());
+    }
+
+    #[test]
+    fn content_range_must_name_a_valid_start() {
+        assert_eq!(content_range_start("bytes 42-99/100"), Some(42));
+        assert_eq!(content_range_start("BYTES 0-9/*"), Some(0));
+        assert_eq!(content_range_start("bytes 99-42/100"), None);
+        assert_eq!(content_range_start("items 42-99/100"), None);
+        assert_eq!(content_range_start("bytes */100"), None);
+    }
+
+    #[test]
+    fn a_resume_with_the_wrong_range_is_rejected_before_append() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\n\
+                      Content-Type: application/octet-stream\r\n\
+                      Content-Range: bytes 2-4/5\r\nContent-Length: 3\r\n\
+                      Connection: close\r\n\r\nnew",
+                )
+                .unwrap();
+        });
+
+        let dir = temp_dir("wrong-range");
+        let b = book();
+        let name = build_filename(&b, None).unwrap();
+        let part = dir.join(format!("{name}.part"));
+        std::fs::write(&part, b"old").unwrap();
+        let mut opts = options(&dir);
+        opts.resume = true;
+        opts.verify = false;
+        let url = format!("http://127.0.0.1:{port}/f").parse().unwrap();
+
+        let error = fetch(&loopback_http(), &url, &b, &opts, &mut |_, _| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("resumed at byte 2"), "{error}");
+        assert_eq!(std::fs::read(&part).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_replace_install_never_clobbers_an_existing_file() {
+        let dir = temp_dir("install-no-replace");
+        let part = dir.join("book.epub.part");
+        let final_path = dir.join("book.epub");
+        std::fs::write(&part, b"new").unwrap();
+        std::fs::write(&final_path, b"existing").unwrap();
+
+        assert!(!install(&part, &final_path, false).unwrap());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"existing");
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forced_install_replaces_an_existing_file() {
+        let dir = temp_dir("install-force");
+        let part = dir.join("book.epub.part");
+        let final_path = dir.join("book.epub");
+        std::fs::write(&part, b"new").unwrap();
+        std::fs::write(&final_path, b"existing").unwrap();
+
+        assert!(install(&part, &final_path, true).unwrap());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"new");
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_slow_stream_is_not_bound_by_the_page_deadline() {
+        let body = b"slow but healthy".to_vec();
+        let digest = crate::md5::hex_digest(&body);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = body.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                served.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            stream.write_all(&served).unwrap();
+        });
+
+        let http = Http::new(crate::net::NetPolicy {
+            allow_http: true,
+            allow_private_hosts: true,
+            request_timeout: Duration::from_millis(30),
+            ..Default::default()
+        })
+        .unwrap();
+        let dir = temp_dir("slow-stream");
+        let mut b = book();
+        b.md5 = digest;
+        let url = format!("http://127.0.0.1:{port}/f").parse().unwrap();
+        let outcome = fetch(&http, &url, &b, &options(&dir), &mut |_, _| {}).unwrap();
+        assert_eq!(std::fs::read(outcome.path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
