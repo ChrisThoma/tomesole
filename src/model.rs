@@ -86,7 +86,30 @@ impl Topic {
         })
     }
 
+    /// The canonical lowercase name, the spelling used in the config file and
+    /// in `ALL_NAMES`. The inverse of the primary `parse` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Topic::Libgen => "libgen",
+            Topic::Fiction => "fiction",
+            Topic::Comics => "comics",
+            Topic::Magazines => "magazines",
+            Topic::Standards => "standards",
+            Topic::RussianFiction => "russian",
+        }
+    }
+
     pub const ALL_NAMES: &'static str = "libgen, fiction, comics, magazines, standards, russian";
+
+    /// Every topic, in the order they read in `ALL_NAMES`.
+    pub const ALL: [Topic; 6] = [
+        Topic::Libgen,
+        Topic::Fiction,
+        Topic::Comics,
+        Topic::Magazines,
+        Topic::Standards,
+        Topic::RussianFiction,
+    ];
 }
 
 /// Which metadata column a query term should be matched against.

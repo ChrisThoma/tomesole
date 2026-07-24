@@ -30,6 +30,10 @@ use crate::graphics::{self, Protocol};
 use crate::mirror::{Pool, ResolveOptions};
 use crate::model::{Book, SearchQuery, human_bytes};
 use crate::net::Http;
+use std::path::PathBuf;
+
+use crate::config::Config;
+use crate::model::Topic;
 use crate::{Settings, cover, download, history, launch, libgen, mirror, net, query};
 
 /// The visual language, in one place so the whole interface stays coherent.
@@ -189,13 +193,25 @@ struct Art {
 enum Tab {
     Search,
     Library,
+    Settings,
 }
 
 impl Tab {
-    fn other(self) -> Self {
+    /// The next tab in the rotation `Tab` steps through; wraps around.
+    fn next(self) -> Self {
         match self {
             Tab::Search => Tab::Library,
+            Tab::Library => Tab::Settings,
+            Tab::Settings => Tab::Search,
+        }
+    }
+
+    /// The previous tab, for `BackTab`.
+    fn prev(self) -> Self {
+        match self {
+            Tab::Search => Tab::Settings,
             Tab::Library => Tab::Search,
+            Tab::Settings => Tab::Library,
         }
     }
 }
@@ -242,6 +258,8 @@ impl Sort {
             Sort::Relevance => match tab {
                 Tab::Search => "relevance",
                 Tab::Library => "recent",
+                // The Settings tab has no list to sort; never reached in practice.
+                Tab::Settings => "relevance",
             },
             Sort::Title => "title",
             Sort::Author => "author",
@@ -414,8 +432,145 @@ const WORDMARK: &str = "\
 const WORDMARK_W: u16 = 70;
 const WORDMARK_H: u16 = 6;
 
+/// One editable row on the Settings tab. The order of the variants is the order
+/// they are shown; the runtime-live ones lead, the startup-only ones follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Covers,
+    History,
+    Verify,
+    MaxSize,
+    Reader,
+    DownloadDir,
+    Limit,
+    Topics,
+    Mirrors,
+    AllowHttp,
+}
+
+/// How a field is edited, which decides what a keypress on it means.
+enum FieldKind {
+    /// A yes/no toggle.
+    Bool,
+    /// A single line of text, committed through a validator.
+    Line,
+    /// The six-way collection multi-select.
+    Topics,
+    /// The ordered mirror list, with add and delete.
+    Mirrors,
+}
+
+impl Field {
+    /// Every field, in display order.
+    const ALL: [Field; 10] = [
+        Field::Covers,
+        Field::History,
+        Field::Verify,
+        Field::MaxSize,
+        Field::Reader,
+        Field::DownloadDir,
+        Field::Limit,
+        Field::Topics,
+        Field::Mirrors,
+        Field::AllowHttp,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Field::Covers => "cover art",
+            Field::History => "history",
+            Field::Verify => "verify downloads",
+            Field::MaxSize => "max download size",
+            Field::Reader => "reader",
+            Field::DownloadDir => "download dir",
+            Field::Limit => "result limit",
+            Field::Topics => "collections",
+            Field::Mirrors => "mirrors",
+            Field::AllowHttp => "allow http",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            Field::Covers => "fetch and draw cover art in the interface",
+            Field::History => "record what gets downloaded",
+            Field::Verify => "check each download against its catalogued MD5 — leave on",
+            Field::MaxSize => "refuse to save a file larger than this, e.g. 4 GB",
+            Field::Reader => "app to open books with; blank means the system default",
+            Field::DownloadDir => "where downloads are saved",
+            Field::Limit => "how many results a search shows",
+            Field::Topics => "which collections a search covers",
+            Field::Mirrors => "mirrors to try first, before auto-discovery",
+            Field::AllowHttp => "permit cleartext http mirrors — off unless you must",
+        }
+    }
+
+    fn kind(self) -> FieldKind {
+        match self {
+            Field::Covers | Field::History | Field::Verify | Field::AllowHttp => FieldKind::Bool,
+            Field::MaxSize | Field::Reader | Field::DownloadDir | Field::Limit => FieldKind::Line,
+            Field::Topics => FieldKind::Topics,
+            Field::Mirrors => FieldKind::Mirrors,
+        }
+    }
+
+    /// True for settings baked in at startup (net policy, mirror pool, search
+    /// defaults): editing them writes the file but only bites next launch.
+    fn deferred(self) -> bool {
+        matches!(
+            self,
+            Field::Limit | Field::Topics | Field::Mirrors | Field::AllowHttp
+        )
+    }
+}
+
+/// Which sub-list, if any, currently has the keyboard on the Settings tab. The
+/// collection and mirror rows have their own vertical cursor, so focusing one
+/// hands `j`/`k` to it until Esc steps back out to the field list.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SubFocus {
+    #[default]
+    None,
+    Topics,
+    Mirrors,
+}
+
+/// A line being typed into a `Line` field, or a new mirror URL.
+#[derive(Debug, Clone, Default)]
+struct Edit {
+    buffer: String,
+    caret: usize,
+}
+
+/// Cursor and edit state for the Settings tab.
+#[derive(Debug, Default)]
+struct SettingsForm {
+    /// Index into [`Field::ALL`] of the highlighted row.
+    selected: usize,
+    /// Which sub-list has focus, if any.
+    sub: SubFocus,
+    /// Cursor within the collections multi-select.
+    topic_row: usize,
+    /// Cursor within the mirror list.
+    mirror_row: usize,
+    /// The line being typed, when a field (or a new mirror) is being edited.
+    editing: Option<Edit>,
+    /// The last validation failure, shown until the next successful edit.
+    error: Option<String>,
+}
+
 pub struct App {
     settings: Settings,
+    /// The config file's own values, as loaded — what the Settings tab edits and
+    /// writes back. Distinct from `settings`, where command-line flags have
+    /// already won, so editing here never rewrites a flag-supplied value.
+    config: Config,
+    /// Cursor and edit state for the Settings tab's form.
+    form: SettingsForm,
+    /// Where the Settings tab writes the config back to. Held as a field, rather
+    /// than read from [`crate::config::config_path`] each time, so a test can
+    /// redirect the write to a throwaway file.
+    config_path: PathBuf,
     tab: Tab,
     mode: Mode,
     query: String,
@@ -530,8 +685,13 @@ fn restore_title(out: &mut impl Write) -> io::Result<()> {
     out.flush()
 }
 
+/// Byte offset of a character index within `s`, for editing in place.
+fn char_byte(s: &str, chars: usize) -> usize {
+    s.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(s.len())
+}
+
 /// Run the interface until the user quits.
-pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
+pub fn run(settings: Settings, config: Config, initial_query: Option<String>) -> Result<()> {
     let (tx, rx) = mpsc::channel();
 
     // Keyboard events arrive on the same channel as worker results, so the UI
@@ -568,6 +728,9 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
     };
     let mut app = App {
         settings,
+        config,
+        form: SettingsForm::default(),
+        config_path: crate::config::config_path(),
         tab: Tab::Search,
         mode: if query.is_empty() {
             Mode::Editing
@@ -979,6 +1142,7 @@ impl App {
         match self.tab {
             Tab::Search => self.refine(),
             Tab::Library => self.refilter(),
+            Tab::Settings => {}
         }
         self.selection_moved();
     }
@@ -1104,6 +1268,8 @@ impl App {
         match self.tab {
             Tab::Search => self.spawn_search_cover(md5),
             Tab::Library => self.spawn_library_cover(md5),
+            // The Settings tab shows no cover, so nothing is ever due for one.
+            Tab::Settings => {}
         }
     }
 
@@ -1210,6 +1376,7 @@ impl App {
         match self.tab {
             Tab::Search => self.selected().map(|b| b.md5.clone()),
             Tab::Library => self.selected_entry().map(|e| e.md5.clone()),
+            Tab::Settings => None,
         }
     }
 
@@ -1316,9 +1483,9 @@ impl App {
         }
         self.tab = tab;
         self.error = None;
-        self.caret = self.input().chars().count();
         match tab {
             Tab::Library => {
+                self.caret = self.input().chars().count();
                 // Downloads made elsewhere since we started belong here too.
                 self.reload_library();
                 // Whatever is painted belongs to the tab we are leaving; the
@@ -1332,12 +1499,26 @@ impl App {
                 };
             }
             Tab::Search => {
+                self.caret = self.input().chars().count();
                 // The detail pane is back, so its cover has to be placed again.
                 self.selection_moved();
                 self.status = match self.results.len() {
                     0 => "press / to search".into(),
                     n => format!("{n} result(s)"),
                 };
+            }
+            Tab::Settings => {
+                // The form has no search box, so `Editing` — the mode a fresh
+                // session Tabs in with — would send arrows and j/k to the search
+                // editor instead of the field list. Browsing is the only mode
+                // the form runs under. Also drop whatever the previous tab
+                // painted, since there is no cover band here.
+                self.mode = Mode::Browsing;
+                self.erase_cover();
+                self.form.editing = None;
+                self.form.sub = SubFocus::None;
+                self.form.error = None;
+                self.status = "settings — ↑↓ move, enter edits, tab leaves".into();
             }
         }
     }
@@ -1518,6 +1699,9 @@ impl App {
         match self.tab {
             Tab::Search => &self.query,
             Tab::Library => &self.filter,
+            // The Settings tab edits through its own buffer, never this box; the
+            // arm is a harmless fallback so the shared editor code stays total.
+            Tab::Settings => &self.query,
         }
     }
 
@@ -1525,6 +1709,7 @@ impl App {
         match self.tab {
             Tab::Search => &mut self.query,
             Tab::Library => &mut self.filter,
+            Tab::Settings => &mut self.query,
         }
     }
 
@@ -1686,23 +1871,41 @@ impl App {
             self.on_key_sort(key);
             return;
         }
+        // A field being typed on the Settings tab captures the tab-switch keys
+        // (Tab, the digits) the same way the search box captures a digit: while
+        // it is up they are text or list movement, not navigation.
+        let settings_editing = self.tab == Tab::Settings
+            && (self.form.editing.is_some() || self.form.sub != SubFocus::None);
+
         // Switching tabs works from everywhere, including mid-typing. The
         // library used to be reachable only from the results list, which meant
         // you had to run a search before you could look at books you already
         // had — exactly backwards.
-        match key.code {
-            KeyCode::Tab | KeyCode::BackTab => {
-                if self.mode == Mode::Help {
-                    self.mode = Mode::Browsing;
+        if !settings_editing {
+            match key.code {
+                KeyCode::Tab => {
+                    if self.mode == Mode::Help {
+                        self.mode = Mode::Browsing;
+                    }
+                    self.show(self.tab.next());
+                    return;
                 }
-                self.show(self.tab.other());
-                return;
+                KeyCode::BackTab => {
+                    if self.mode == Mode::Help {
+                        self.mode = Mode::Browsing;
+                    }
+                    self.show(self.tab.prev());
+                    return;
+                }
+                // Direct jumps, for when you know where you are going. Not while
+                // typing, where a digit is a digit.
+                KeyCode::Char('1') if self.mode != Mode::Editing => return self.show(Tab::Search),
+                KeyCode::Char('2') if self.mode != Mode::Editing => return self.show(Tab::Library),
+                KeyCode::Char('3') if self.mode != Mode::Editing => {
+                    return self.show(Tab::Settings);
+                }
+                _ => {}
             }
-            // Direct jumps, for when you know where you are going. Not while
-            // typing, where a digit is a digit.
-            KeyCode::Char('1') if self.mode != Mode::Editing => return self.show(Tab::Search),
-            KeyCode::Char('2') if self.mode != Mode::Editing => return self.show(Tab::Library),
-            _ => {}
         }
         match self.mode {
             Mode::Help => self.mode = Mode::Browsing,
@@ -1710,6 +1913,7 @@ impl App {
             Mode::Browsing => match self.tab {
                 Tab::Search => self.on_key_results(key),
                 Tab::Library => self.on_key_library(key),
+                Tab::Settings => self.on_key_settings(key),
             },
         }
     }
@@ -1767,6 +1971,9 @@ impl App {
         match self.tab {
             Tab::Search => self.move_by(delta),
             Tab::Library => self.move_library_by(delta),
+            // The Settings tab never enters `Mode::Editing`, so this is unreached
+            // from there; the arm keeps the match total.
+            Tab::Settings => {}
         }
     }
 
@@ -1961,6 +2168,352 @@ impl App {
         }
     }
 
+    // --- the settings form ------------------------------------------------
+
+    /// The field the cursor is on.
+    fn current_field(&self) -> Field {
+        Field::ALL[self.form.selected.min(Field::ALL.len() - 1)]
+    }
+
+    fn on_key_settings(&mut self, key: KeyEvent) {
+        // A line being typed takes precedence over everything else.
+        if self.form.editing.is_some() {
+            self.on_key_settings_edit(key);
+            return;
+        }
+        match self.form.sub {
+            SubFocus::Topics => self.on_key_topics(key),
+            SubFocus::Mirrors => self.on_key_mirrors(key),
+            SubFocus::None => match key.code {
+                KeyCode::Char('q') => self.quit = true,
+                KeyCode::Char('?') => self.mode = Mode::Help,
+                KeyCode::Down | KeyCode::Char('j') => self.move_field(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_field(-1),
+                KeyCode::Home | KeyCode::Char('g') => self.select_field(0),
+                KeyCode::End | KeyCode::Char('G') => self.select_field(Field::ALL.len() - 1),
+                KeyCode::Enter | KeyCode::Char(' ') => self.activate_field(),
+                _ => {}
+            },
+        }
+    }
+
+    fn move_field(&mut self, delta: isize) {
+        let last = (Field::ALL.len() - 1) as isize;
+        let next = (self.form.selected as isize + delta).clamp(0, last) as usize;
+        self.select_field(next);
+    }
+
+    fn select_field(&mut self, index: usize) {
+        self.form.selected = index.min(Field::ALL.len() - 1);
+        self.form.error = None;
+    }
+
+    /// Enter, or space, on the highlighted field: toggle a bool, open a line
+    /// editor, or step into a sub-list.
+    fn activate_field(&mut self) {
+        let field = self.current_field();
+        self.form.error = None;
+        match field.kind() {
+            FieldKind::Bool => self.toggle_bool(field),
+            FieldKind::Line => {
+                self.form.editing = Some(Edit {
+                    caret: self.field_value(field).chars().count(),
+                    buffer: self.field_value(field),
+                });
+            }
+            FieldKind::Topics => {
+                self.form.sub = SubFocus::Topics;
+                self.form.topic_row = 0;
+            }
+            FieldKind::Mirrors => {
+                self.form.sub = SubFocus::Mirrors;
+                self.form.mirror_row = 0;
+            }
+        }
+    }
+
+    /// Editing a `Line` field: a small self-contained line editor whose buffer
+    /// lives on the form, kept apart from the search box's own caret.
+    fn on_key_settings_edit(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(edit) = self.form.editing.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let text = edit.buffer.clone();
+                self.commit_edit(text);
+            }
+            KeyCode::Esc => {
+                self.form.editing = None;
+            }
+            KeyCode::Char('u') if ctrl => {
+                edit.buffer.clear();
+                edit.caret = 0;
+            }
+            KeyCode::Char(c) => {
+                let at = char_byte(&edit.buffer, edit.caret);
+                edit.buffer.insert(at, c);
+                edit.caret += 1;
+            }
+            KeyCode::Backspace if edit.caret > 0 => {
+                let at = char_byte(&edit.buffer, edit.caret - 1);
+                edit.buffer.remove(at);
+                edit.caret -= 1;
+            }
+            KeyCode::Left => edit.caret = edit.caret.saturating_sub(1),
+            KeyCode::Right => edit.caret = (edit.caret + 1).min(edit.buffer.chars().count()),
+            KeyCode::Home => edit.caret = 0,
+            KeyCode::End => edit.caret = edit.buffer.chars().count(),
+            _ => {}
+        }
+    }
+
+    /// Validate and store a committed line, or keep the editor open with an
+    /// error. The mirror sub-mode uses this too, to add a typed URL.
+    fn commit_edit(&mut self, text: String) {
+        if self.form.sub == SubFocus::Mirrors {
+            let url = text.trim();
+            if url.is_empty() {
+                self.form.editing = None;
+                return;
+            }
+            self.config.mirrors.push(url.to_string());
+            self.form.mirror_row = self.config.mirrors.len() - 1;
+            self.form.editing = None;
+            self.persist();
+            return;
+        }
+
+        let field = self.current_field();
+        match self.set_field(field, &text) {
+            Ok(()) => {
+                self.form.editing = None;
+                self.form.error = None;
+                self.persist();
+                self.apply_live(field);
+            }
+            Err(message) => self.form.error = Some(message),
+        }
+    }
+
+    /// Parse `text` for `field` and write it into the config, or return why not.
+    /// An empty line clears an optional field back to its default.
+    fn set_field(&mut self, field: Field, text: &str) -> std::result::Result<(), String> {
+        let text = text.trim();
+        match field {
+            Field::MaxSize => {
+                self.config.max_size = if text.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::model::parse_size(text)
+                            .ok_or_else(|| format!("`{text}` is not a size, try e.g. 4 GB"))?,
+                    )
+                };
+            }
+            Field::Limit => {
+                self.config.limit = if text.is_empty() {
+                    None
+                } else {
+                    Some(
+                        text.parse::<usize>()
+                            .map_err(|_| format!("`{text}` is not a whole number"))?,
+                    )
+                };
+            }
+            Field::Reader => {
+                self.config.reader = (!text.is_empty()).then(|| text.to_string());
+            }
+            Field::DownloadDir => {
+                self.config.download_dir =
+                    (!text.is_empty()).then(|| crate::config::expand_tilde(text));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn toggle_bool(&mut self, field: Field) {
+        let now = match field {
+            Field::Covers => !self.config.covers.unwrap_or(true),
+            Field::History => !self.config.history.unwrap_or(true),
+            Field::Verify => !self.config.verify.unwrap_or(true),
+            Field::AllowHttp => !self.config.allow_http,
+            _ => return,
+        };
+        match field {
+            Field::Covers => self.config.covers = Some(now),
+            Field::History => self.config.history = Some(now),
+            Field::Verify => self.config.verify = Some(now),
+            Field::AllowHttp => self.config.allow_http = now,
+            _ => {}
+        }
+        self.persist();
+        self.apply_live(field);
+    }
+
+    fn on_key_topics(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => self.form.sub = SubFocus::None,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.form.topic_row = (self.form.topic_row + 1).min(Topic::ALL.len() - 1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.form.topic_row = self.form.topic_row.saturating_sub(1);
+            }
+            KeyCode::Char(' ') => self.toggle_topic(Topic::ALL[self.form.topic_row]),
+            _ => {}
+        }
+    }
+
+    /// Flip one collection's membership. The set starts from the effective
+    /// default the first time it is touched, so a toggle reads as a toggle.
+    fn toggle_topic(&mut self, topic: Topic) {
+        let mut topics = self
+            .config
+            .topics
+            .clone()
+            .unwrap_or_else(|| vec![Topic::Libgen, Topic::Fiction]);
+        if let Some(i) = topics.iter().position(|&t| t == topic) {
+            topics.remove(i);
+        } else {
+            // Keep the canonical order so the file reads tidily.
+            topics.push(topic);
+            topics.sort_by_key(|t| Topic::ALL.iter().position(|x| x == t).unwrap_or(0));
+        }
+        self.config.topics = Some(topics);
+        self.persist();
+    }
+
+    fn on_key_mirrors(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.form.sub = SubFocus::None,
+            KeyCode::Down | KeyCode::Char('j') => {
+                let last = self.config.mirrors.len().saturating_sub(1);
+                self.form.mirror_row = (self.form.mirror_row + 1).min(last);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.form.mirror_row = self.form.mirror_row.saturating_sub(1);
+            }
+            KeyCode::Char('a') => {
+                // Add a mirror: an empty line editor, committed as a new URL.
+                self.form.editing = Some(Edit::default());
+            }
+            KeyCode::Char('d') | KeyCode::Delete
+                if self.form.mirror_row < self.config.mirrors.len() =>
+            {
+                self.config.mirrors.remove(self.form.mirror_row);
+                let last = self.config.mirrors.len().saturating_sub(1);
+                self.form.mirror_row = self.form.mirror_row.min(last);
+                self.persist();
+            }
+            _ => {}
+        }
+    }
+
+    /// Write the config to disk, reporting the outcome in the status line.
+    fn persist(&mut self) {
+        match self.config.save_to(&self.config_path) {
+            Ok(()) => {
+                self.form.error = None;
+                self.status = format!("saved to {}", self.config_path.display());
+            }
+            Err(e) => self.form.error = Some(e.to_string()),
+        }
+    }
+
+    /// Fold a just-saved change into the running session where it is safe to.
+    /// The startup-established settings (net policy, mirror pool, search
+    /// defaults) are left for next launch; the form flags those.
+    fn apply_live(&mut self, field: Field) {
+        match field {
+            Field::Covers => {
+                let on = self.config.covers.unwrap_or(true);
+                self.settings.covers = on;
+                if !on {
+                    self.erase_cover();
+                    self.covers.clear();
+                    self.cover_due = None;
+                }
+            }
+            Field::History => self.settings.history = self.config.history.unwrap_or(true),
+            Field::Verify => self.settings.verify = self.config.verify.unwrap_or(true),
+            Field::Reader => self.settings.reader = self.config.reader.clone(),
+            Field::MaxSize => {
+                self.settings.max_bytes = self.config.max_size.unwrap_or(self.settings.max_bytes);
+            }
+            Field::DownloadDir => {
+                if let Some(dir) = self.config.download_dir.clone() {
+                    self.settings.dest_dir = dir;
+                }
+            }
+            // Deferred: only takes effect next launch.
+            _ => {}
+        }
+    }
+
+    /// The row's value as shown in the form (friendly, not the raw edit text).
+    fn field_display(&self, field: Field) -> String {
+        let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
+        match field {
+            Field::Covers => on_off(self.config.covers.unwrap_or(true)),
+            Field::History => on_off(self.config.history.unwrap_or(true)),
+            Field::Verify => on_off(self.config.verify.unwrap_or(true)),
+            Field::AllowHttp => on_off(self.config.allow_http),
+            Field::MaxSize => match self.config.max_size {
+                Some(n) => crate::model::human_bytes(n),
+                None => "4 GB (default)".into(),
+            },
+            Field::Reader => self
+                .config
+                .reader
+                .clone()
+                .unwrap_or_else(|| "system default".into()),
+            Field::DownloadDir => match &self.config.download_dir {
+                Some(p) => p.display().to_string(),
+                None => format!("{} (default)", crate::config::default_download_dir().display()),
+            },
+            Field::Limit => match self.config.limit {
+                Some(n) => n.to_string(),
+                None => "25 (default)".into(),
+            },
+            Field::Topics => {
+                let topics = self
+                    .config
+                    .topics
+                    .clone()
+                    .unwrap_or_else(|| vec![Topic::Libgen, Topic::Fiction]);
+                topics
+                    .iter()
+                    .map(|t| t.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+            Field::Mirrors => match self.config.mirrors.len() {
+                0 => "auto".into(),
+                1 => "1 mirror".into(),
+                n => format!("{n} mirrors"),
+            },
+        }
+    }
+
+    /// The raw editable text for a `Line` field.
+    fn field_value(&self, field: Field) -> String {
+        match field {
+            Field::MaxSize => self.config.max_size.map(|n| n.to_string()).unwrap_or_default(),
+            Field::Reader => self.config.reader.clone().unwrap_or_default(),
+            Field::DownloadDir => self
+                .config
+                .download_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            Field::Limit => self.config.limit.map(|n| n.to_string()).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     fn move_library_by(&mut self, delta: isize) {
         if self.shown.is_empty() {
             return;
@@ -2055,8 +2608,13 @@ impl App {
         let landing = match self.tab {
             Tab::Search => self.results.is_empty(),
             Tab::Library => self.library.is_empty(),
+            Tab::Settings => false,
         };
-        if landing {
+        if self.tab == Tab::Settings {
+            // The form is its own thing: a full-height list of fields with the
+            // hints at the foot, and no landing state, cover band or search box.
+            self.render_settings(frame, area);
+        } else if landing {
             self.render_landing(frame, area);
         } else {
             // The record for the selected row lies as a horizontal band across
@@ -2069,10 +2627,12 @@ impl App {
             let filter_bar = match self.tab {
                 Tab::Search => !self.results.is_empty(),
                 Tab::Library => !self.library.is_empty(),
+                Tab::Settings => false,
             } as u16;
             let empty_tab = match self.tab {
                 Tab::Search => self.visible.is_empty(),
                 Tab::Library => self.shown.is_empty(),
+                Tab::Settings => false,
             };
             let details = if empty_tab && self.error.is_none() {
                 0
@@ -2097,11 +2657,14 @@ impl App {
                     self.render_library(frame, chunks[0]);
                     self.render_library_details(frame, chunks[1]);
                 }
+                // Handled by the `Tab::Settings` branch above; this arm is dead.
+                Tab::Settings => {}
             }
             if filter_bar == 1 {
                 match self.tab {
                     Tab::Search => self.render_filters(frame, chunks[2]),
                     Tab::Library => self.render_library_strip(frame, chunks[2]),
+                    Tab::Settings => {}
                 }
             }
             self.render_input(frame, chunks[3]);
@@ -2219,6 +2782,8 @@ impl App {
                         Span::styled(" to go find one.", theme::faint()),
                     ]),
                 ],
+                // The Settings tab has no landing state, so this is never drawn.
+                Tab::Settings => Vec::new(),
             }
         };
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
@@ -2631,34 +3196,10 @@ impl App {
             theme::FAINT
         };
 
-        let tab = |label: &str, count: Option<usize>, active: bool| {
-            let text = match count {
-                Some(n) => format!("  {label} {n}  "),
-                None => format!("  {label}  "),
-            };
-            Span::styled(
-                text,
-                if active {
-                    // The active tab is a solid accent chip: colour and reverse
-                    // together, so it is unmistakable even without truecolour.
-                    Style::new()
-                        .fg(Color::Rgb(18, 24, 28))
-                        .bg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    theme::faint()
-                },
-            )
-        };
-
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(border))
-            .title(Line::from(vec![
-                tab("1 SEARCH", None, self.tab == Tab::Search),
-                Span::raw(" "),
-                tab("2 LIBRARY", Some(self.library.len()), self.tab == Tab::Library),
-            ]))
+            .title(Line::from(self.tab_chips()))
             .title_top(
                 Line::from(vec![
                     Span::styled("● ", match self.tab {
@@ -2666,13 +3207,14 @@ impl App {
                         // are still looking — status you can read at a glance.
                         Tab::Search if !self.mirrors.is_empty() => theme::accent(),
                         Tab::Search => Style::new().fg(theme::AMBER),
-                        Tab::Library => theme::accent(),
+                        Tab::Library | Tab::Settings => theme::accent(),
                     }),
                     Span::styled(
                         match self.tab {
                             Tab::Search => format!("{} ", self.mirror_label),
                             // The mirror is irrelevant to books already on disk.
                             Tab::Library => "on this machine ".to_string(),
+                            Tab::Settings => String::new(),
                         },
                         theme::muted(),
                     ),
@@ -2692,6 +3234,7 @@ impl App {
                 match self.tab {
                     Tab::Search => "press / to search Library Genesis",
                     Tab::Library => "press / to filter your books",
+                    Tab::Settings => "",
                 },
                 theme::faint(),
             )
@@ -3417,6 +3960,183 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
+    /// The row of tab chips shown as the box title on every tab: the active one
+    /// a solid accent chip, the rest faint.
+    fn tab_chips(&self) -> Vec<Span<'static>> {
+        fn chip(label: &str, count: Option<usize>, active: bool) -> Span<'static> {
+            let text = match count {
+                Some(n) => format!("  {label} {n}  "),
+                None => format!("  {label}  "),
+            };
+            Span::styled(
+                text,
+                if active {
+                    // Colour and reverse together, so the active chip is
+                    // unmistakable even without truecolour.
+                    Style::new()
+                        .fg(Color::Rgb(18, 24, 28))
+                        .bg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    theme::faint()
+                },
+            )
+        }
+        vec![
+            chip("1 SEARCH", None, self.tab == Tab::Search),
+            Span::raw(" "),
+            chip("2 LIBRARY", Some(self.library.len()), self.tab == Tab::Library),
+            Span::raw(" "),
+            chip("3 SETTINGS", None, self.tab == Tab::Settings),
+        ]
+    }
+
+    /// The Settings tab: a list of every config key with its current value, the
+    /// highlighted field's help beneath, and — while one is being changed — an
+    /// inline editor or an expanded sub-list.
+    fn render_settings(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::vertical([
+            Constraint::Min(3),     // the form
+            Constraint::Length(2),  // help / error for the current field
+            Constraint::Length(1),  // key hints
+        ])
+        .split(area);
+
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(theme::FAINT))
+            .title(Line::from(self.tab_chips()));
+        let inner = block.inner(rows[0]);
+        frame.render_widget(block, rows[0]);
+
+        let editing_line = self.form.editing.is_some();
+        let mut lines: Vec<Line> = vec![Line::from("")];
+
+        for (i, &field) in Field::ALL.iter().enumerate() {
+            let selected = i == self.form.selected;
+            let marker = if selected { " ▸ " } else { "   " };
+            let label_style = if selected {
+                theme::text().add_modifier(Modifier::BOLD)
+            } else {
+                theme::muted()
+            };
+            let label = Span::styled(format!("{marker}{:<20}", field.label()), label_style);
+
+            if selected && editing_line && matches!(field.kind(), FieldKind::Line) {
+                let mut spans = vec![label];
+                spans.extend(self.edit_spans());
+                lines.push(Line::from(spans));
+            } else {
+                let value_style = if selected {
+                    theme::accent()
+                } else {
+                    theme::faint()
+                };
+                lines.push(Line::from(vec![
+                    label,
+                    Span::styled(self.field_display(field), value_style),
+                ]));
+            }
+
+            // The collections and mirror lists expand under their row while they
+            // hold focus, each with its own cursor.
+            if selected && self.form.sub == SubFocus::Topics && field == Field::Topics {
+                let chosen = self.topics_effective();
+                for (ti, &topic) in Topic::ALL.iter().enumerate() {
+                    let cursor = if ti == self.form.topic_row { " ▸ " } else { "   " };
+                    let mark = if chosen.contains(&topic) { "[x] " } else { "[ ] " };
+                    let style = if ti == self.form.topic_row {
+                        theme::text()
+                    } else {
+                        theme::faint()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("     {cursor}{mark}{}", topic.name()),
+                        style,
+                    )));
+                }
+            }
+            if selected && self.form.sub == SubFocus::Mirrors && field == Field::Mirrors {
+                if self.config.mirrors.is_empty() && !editing_line {
+                    lines.push(Line::from(Span::styled(
+                        "        (none — press a to add one)",
+                        theme::faint(),
+                    )));
+                }
+                for (mi, mirror) in self.config.mirrors.iter().enumerate() {
+                    let cursor = if mi == self.form.mirror_row { " ▸ " } else { "   " };
+                    let style = if mi == self.form.mirror_row {
+                        theme::text()
+                    } else {
+                        theme::faint()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("     {cursor}{mirror}"),
+                        style,
+                    )));
+                }
+                if editing_line {
+                    let mut spans = vec![Span::styled("        ", theme::faint())];
+                    spans.extend(self.edit_spans());
+                    lines.push(Line::from(spans));
+                }
+            }
+        }
+
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        // The current field's help, or the last validation error in its place.
+        let field = self.current_field();
+        let help = if let Some(err) = &self.form.error {
+            Line::from(Span::styled(
+                format!(" ⚠ {err}"),
+                Style::new().fg(theme::DANGER),
+            ))
+        } else {
+            let mut spans = vec![Span::styled(format!(" {}", field.help()), theme::muted())];
+            if field.deferred() {
+                spans.push(Span::styled("  (applies next launch)", theme::faint()));
+            }
+            Line::from(spans)
+        };
+        frame.render_widget(Paragraph::new(help), rows[1]);
+
+        self.render_hints(frame, rows[2]);
+    }
+
+    /// The spans for the line currently being typed, with a reversed cell at the
+    /// caret so it reads as a cursor.
+    fn edit_spans(&self) -> Vec<Span<'static>> {
+        let Some(edit) = &self.form.editing else {
+            return Vec::new();
+        };
+        let chars: Vec<char> = edit.buffer.chars().collect();
+        let mut spans = Vec::new();
+        for (i, c) in chars.iter().enumerate() {
+            let style = if i == edit.caret {
+                theme::text().add_modifier(Modifier::REVERSED)
+            } else {
+                theme::text()
+            };
+            spans.push(Span::styled(c.to_string(), style));
+        }
+        if edit.caret >= chars.len() {
+            spans.push(Span::styled(
+                " ",
+                theme::text().add_modifier(Modifier::REVERSED),
+            ));
+        }
+        spans
+    }
+
+    /// The collections currently in force: the config's set, or the default.
+    fn topics_effective(&self) -> Vec<Topic> {
+        self.config
+            .topics
+            .clone()
+            .unwrap_or_else(|| vec![Topic::Libgen, Topic::Fiction])
+    }
+
     fn render_hints(&self, frame: &mut Frame, area: Rect) {
         // Each hint is a (key, label) pair; the key rides in the accent, the
         // label sits faint beneath it, so the bar reads as a legend rather than
@@ -3461,6 +4181,25 @@ impl App {
                 ("?", "help"),
                 ("q", "quit"),
             ],
+            // The Settings tab stays in `Browsing`; its state lives on the form,
+            // so the hints follow what the form is doing.
+            (_, Tab::Settings) if self.form.editing.is_some() => {
+                &[("⏎", "save"), ("esc", "cancel"), ("^u", "clear")]
+            }
+            (_, Tab::Settings) if self.form.sub == SubFocus::Topics => {
+                &[("↑↓", "move"), ("space", "toggle"), ("esc", "done")]
+            }
+            (_, Tab::Settings) if self.form.sub == SubFocus::Mirrors => {
+                &[("↑↓", "move"), ("a", "add"), ("d", "delete"), ("esc", "done")]
+            }
+            (_, Tab::Settings) => &[
+                ("tab", "search"),
+                ("↑↓", "move"),
+                ("⏎", "edit"),
+                ("space", "toggle"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
         };
 
         let mut spans = vec![Span::raw(" ")];
@@ -3481,12 +4220,12 @@ impl App {
 
     fn render_help(&self, frame: &mut Frame) {
         // Grouped by tab, because which keys apply depends on where you are.
-        let sections: [(&str, &[(&str, &str)]); 3] = [
+        let sections: [(&str, &[(&str, &str)]); 4] = [
             (
                 "anywhere",
                 &[
-                    ("tab", "switch between Search and Library"),
-                    ("1  2", "go straight to a tab"),
+                    ("tab", "cycle Search · Library · Settings"),
+                    ("1  2  3", "go straight to a tab"),
                     ("/  i", "type in the box"),
                     ("↑ ↓  k j", "move the selection"),
                     ("PgUp PgDn", "move ten at a time"),
@@ -3520,6 +4259,18 @@ impl App {
                     ("/", "filter by title, author or filename"),
                     ("d", "forget an entry (the file stays)"),
                     ("r", "re-read the library from disk"),
+                ],
+            ),
+            (
+                "settings tab",
+                &[
+                    ("↑ ↓", "move between settings"),
+                    ("⏎", "edit a value, or step into a list"),
+                    ("space", "toggle a yes/no setting"),
+                    ("", "  collections: space toggles, esc leaves"),
+                    ("a  d", "mirrors: add a URL / delete the marked one"),
+                    ("esc", "cancel an edit or leave a list"),
+                    ("", "every change is saved as you make it"),
                 ],
             ),
         ];
@@ -3853,6 +4604,13 @@ mod tests {
                 history: false,
                 covers: false,
             },
+            config: Config::default(),
+            form: SettingsForm::default(),
+            config_path: std::env::temp_dir().join(format!(
+                "tomesole-cfg-test-{}-{:?}.conf",
+                std::process::id(),
+                std::thread::current().id()
+            )),
             tab: Tab::Search,
             mode: Mode::Editing,
             query: String::new(),
@@ -4509,6 +5267,16 @@ mod tests {
 
             a.mode = Mode::Help;
             let _ = draw(&mut a, w, h);
+
+            // The settings form has its own layout — a long field list, a sub-
+            // list and an active editor — so exercise those at the extremes too.
+            a.mode = Mode::Browsing;
+            a.tab = Tab::Settings;
+            let _ = draw(&mut a, w, h);
+            a.form.selected = Field::ALL.iter().position(|&f| f == Field::Mirrors).unwrap();
+            a.form.sub = SubFocus::Mirrors;
+            a.config.mirrors = vec!["https://a.example".into(), "https://b.example".into()];
+            let _ = draw(&mut a, w, h);
         }
     }
 
@@ -4744,9 +5512,12 @@ mod tests {
         assert_eq!(a.tab, Tab::Search);
         assert_eq!(a.mode, Mode::Editing, "a fresh session starts typing");
 
-        // Tab reaches the library even mid-edit, with nothing searched yet.
+        // Tab reaches the library even mid-edit, with nothing searched yet, and
+        // then rotates on through Settings and back to Search.
         press(&mut a, KeyCode::Tab);
         assert_eq!(a.tab, Tab::Library);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.tab, Tab::Settings);
         press(&mut a, KeyCode::Tab);
         assert_eq!(a.tab, Tab::Search);
 
@@ -4754,6 +5525,8 @@ mod tests {
         a.mode = Mode::Browsing;
         press(&mut a, KeyCode::Char('2'));
         assert_eq!(a.tab, Tab::Library);
+        press(&mut a, KeyCode::Char('3'));
+        assert_eq!(a.tab, Tab::Settings);
         press(&mut a, KeyCode::Char('1'));
         assert_eq!(a.tab, Tab::Search);
     }
@@ -4764,6 +5537,176 @@ mod tests {
         with_library(&mut a, entries(3));
         press(&mut a, KeyCode::Char('q'));
         assert!(a.quit, "the library is a peer of search, not a detour");
+    }
+
+    // --- the settings tab -------------------------------------------------
+
+    /// Open the Settings tab from a fresh browsing session.
+    fn open_settings(a: &mut App) {
+        a.mode = Mode::Browsing;
+        press(a, KeyCode::Char('3'));
+        assert_eq!(a.tab, Tab::Settings);
+    }
+
+    /// Walk the field cursor to a given field.
+    fn go_to(a: &mut App, field: Field) {
+        let target = Field::ALL.iter().position(|&f| f == field).unwrap();
+        while a.form.selected < target {
+            press(a, KeyCode::Down);
+        }
+        while a.form.selected > target {
+            press(a, KeyCode::Up);
+        }
+        assert_eq!(a.current_field(), field);
+    }
+
+    fn type_str(a: &mut App, s: &str) {
+        for c in s.chars() {
+            press(a, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn arrows_move_the_field_cursor_after_tabbing_in_from_a_fresh_session() {
+        // A fresh session opens in the search box (Mode::Editing). Tabbing all
+        // the way round to Settings must hand the arrows to the field list, not
+        // leave them driving the search editor.
+        let mut a = app();
+        assert_eq!(a.mode, Mode::Editing, "a fresh session starts typing");
+        press(&mut a, KeyCode::Tab); // Library
+        press(&mut a, KeyCode::Tab); // Settings
+        assert_eq!(a.tab, Tab::Settings);
+        assert_eq!(a.mode, Mode::Browsing, "the form never runs while editing");
+
+        assert_eq!(a.form.selected, 0);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.form.selected, 1, "down moves the field cursor");
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.form.selected, 2, "j moves it too");
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.form.selected, 1);
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn toggling_a_bool_updates_the_config_applies_live_and_saves() {
+        let mut a = app();
+        a.settings.covers = true;
+        open_settings(&mut a);
+        go_to(&mut a, Field::Covers);
+
+        press(&mut a, KeyCode::Char(' '));
+        assert_eq!(a.config.covers, Some(false), "the file value flips");
+        assert!(!a.settings.covers, "and the running session follows");
+        // Autosave landed the change on disk.
+        let written = std::fs::read_to_string(&a.config_path).unwrap();
+        assert!(written.contains("covers = false"), "got: {written}");
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn a_line_field_rejects_junk_and_accepts_a_valid_value() {
+        let mut a = app();
+        open_settings(&mut a);
+        go_to(&mut a, Field::MaxSize);
+
+        // Enter the editor and type something that is not a size.
+        press(&mut a, KeyCode::Enter);
+        type_str(&mut a, "bogus");
+        press(&mut a, KeyCode::Enter);
+        assert!(a.form.editing.is_some(), "a bad value keeps the editor open");
+        assert!(a.form.error.is_some(), "and reports why");
+        assert_eq!(a.config.max_size, None, "nothing is stored");
+
+        // Clear it and type a real size.
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_str(&mut a, "2 GB");
+        press(&mut a, KeyCode::Enter);
+        assert!(a.form.editing.is_none(), "a good value commits");
+        assert_eq!(a.config.max_size, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(a.settings.max_bytes, 2 * 1024 * 1024 * 1024, "applied live");
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn editing_a_path_field_expands_a_tilde() {
+        let mut a = app();
+        open_settings(&mut a);
+        go_to(&mut a, Field::DownloadDir);
+        press(&mut a, KeyCode::Enter);
+        type_str(&mut a, "~/Books");
+        press(&mut a, KeyCode::Enter);
+        let dir = a.config.download_dir.clone().unwrap();
+        assert!(dir.ends_with("Books"));
+        assert!(!dir.to_string_lossy().starts_with('~'), "tilde is expanded");
+        assert_eq!(a.settings.dest_dir, dir, "the session downloads there now");
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn collections_can_be_toggled_in_a_sub_list() {
+        let mut a = app();
+        open_settings(&mut a);
+        go_to(&mut a, Field::Topics);
+        // Default is libgen + fiction; step into the list.
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.form.sub, SubFocus::Topics);
+        // Cursor starts on libgen — turn it off.
+        assert_eq!(Topic::ALL[a.form.topic_row], Topic::Libgen);
+        press(&mut a, KeyCode::Char(' '));
+        let topics = a.config.topics.clone().unwrap();
+        assert!(!topics.contains(&Topic::Libgen));
+        assert!(topics.contains(&Topic::Fiction));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.form.sub, SubFocus::None);
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn mirrors_can_be_added_and_deleted() {
+        let mut a = app();
+        open_settings(&mut a);
+        go_to(&mut a, Field::Mirrors);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.form.sub, SubFocus::Mirrors);
+
+        // Add one.
+        press(&mut a, KeyCode::Char('a'));
+        type_str(&mut a, "https://libgen.example");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.config.mirrors, ["https://libgen.example"]);
+
+        // Delete it again.
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.config.mirrors.is_empty());
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn a_field_edit_captures_the_tab_key_instead_of_switching() {
+        let mut a = app();
+        open_settings(&mut a);
+        go_to(&mut a, Field::Reader);
+        press(&mut a, KeyCode::Enter); // start editing
+        press(&mut a, KeyCode::Tab); // must be swallowed, not a tab switch
+        assert_eq!(a.tab, Tab::Settings, "tab does not leave mid-edit");
+        assert!(a.form.editing.is_some());
+        let _ = std::fs::remove_file(&a.config_path);
+    }
+
+    #[test]
+    fn the_settings_tab_renders_with_its_fields_and_sub_lists() {
+        let mut a = app();
+        open_settings(&mut a);
+        // Expand the collections list so the checkboxes render too.
+        go_to(&mut a, Field::Topics);
+        press(&mut a, KeyCode::Enter);
+        let screen = draw(&mut a, 80, 24);
+        assert!(screen.contains("SETTINGS"), "the tab bar names the tab");
+        assert!(screen.contains("cover art"), "a field label shows");
+        assert!(screen.contains("[x] libgen"), "the collections sub-list expands");
+        assert!(screen.contains("applies next launch"), "deferred fields say so");
+        let _ = std::fs::remove_file(&a.config_path);
     }
 
     #[test]

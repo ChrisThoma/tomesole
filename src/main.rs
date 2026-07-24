@@ -97,7 +97,7 @@ fn run(argv: &[String], style: &Style) -> Result<i32> {
                 print!("{}", args::help_text(style));
                 return Ok(0);
             }
-            tui::run(settings(&cli.global, &config), query.clone())?;
+            tui::run(settings(&cli.global, &config), config.clone(), query.clone())?;
             Ok(0)
         }
         Command::Search(_) => cmd_search(&cli, &config, style),

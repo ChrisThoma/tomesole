@@ -105,9 +105,130 @@ impl Config {
         }
         Ok(cfg)
     }
+
+    /// Render the config back to its file form.
+    ///
+    /// The output mirrors [`TEMPLATE`]: a set value becomes an active
+    /// `key = value` line, an unset one stays a commented example, so the file
+    /// keeps its own documentation whether or not a field is in use. This
+    /// regenerates the file rather than editing it in place, so a hand-written
+    /// comment or a custom ordering is not preserved — the guidance comments are.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# tomesole configuration.\n");
+        out.push_str("# Command-line flags override everything here.\n\n");
+
+        line(
+            &mut out,
+            "# Mirrors to try first, in order. Repeat the key or use a comma-separated list.\n\
+             # Leave unset to use the built-in list plus auto-discovery.",
+            "mirror",
+            (!self.mirrors.is_empty()).then(|| self.mirrors.join(", ")),
+            "https://libgen.li",
+        );
+        line(
+            &mut out,
+            "# Where downloads are saved.",
+            "download_dir",
+            self.download_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            "~/Downloads",
+        );
+        line(
+            &mut out,
+            "# Default number of results to show.",
+            "limit",
+            self.limit.map(|n| n.to_string()),
+            "25",
+        );
+        line(
+            &mut out,
+            "# Collections to search: libgen, fiction, comics, magazines, standards, russian",
+            "topics",
+            self.topics
+                .as_ref()
+                .map(|t| t.iter().map(|topic| topic.name()).collect::<Vec<_>>().join(", ")),
+            "libgen, fiction",
+        );
+        line(
+            &mut out,
+            "# Refuse to save a file larger than this.",
+            "max_size",
+            self.max_size.map(|n| n.to_string()),
+            "4 GB",
+        );
+        line(
+            &mut out,
+            "# Verify each download against the MD5 the catalogue advertises.\n\
+             # Turning this off removes the only integrity check available. Don't.",
+            "verify",
+            self.verify.map(|b| b.to_string()),
+            "true",
+        );
+        line(
+            &mut out,
+            "# What `tomesole open` hands a book to. On macOS this is an application name,\n\
+             # passed to `open -a`; elsewhere it is a command run with the file as its\n\
+             # argument. Unset means the system default for the file type.",
+            "reader",
+            self.reader.clone(),
+            "Books",
+        );
+        line(
+            &mut out,
+            "# Keep a record of what has been downloaded, for `tomesole history`.",
+            "history",
+            self.history.map(|b| b.to_string()),
+            "true",
+        );
+        line(
+            &mut out,
+            "# Fetch and draw cover art in the full-screen interface.",
+            "covers",
+            self.covers.map(|b| b.to_string()),
+            "true",
+        );
+        line(
+            &mut out,
+            "# Permit cleartext http mirrors. Off unless you have a specific reason.",
+            "allow_http",
+            self.allow_http.then(|| "true".to_string()),
+            "false",
+        );
+        out
+    }
+
+    /// Write the config to its standard path, creating the directory if needed.
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&config_path())
+    }
+
+    /// Write the config to a specific path, creating its directory. The thin
+    /// [`save`](Self::save) wrapper targets the standard location; taking the
+    /// path explicitly keeps the writing logic testable without touching it.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        std::fs::write(path, self.render())
+            .with_context(|| format!("could not write {}", path.display()))
+    }
 }
 
-fn parse_bool(value: &str) -> Result<bool> {
+/// Emit one config entry: its comment block, then either the active
+/// `key = value` when `value` is set or a commented `# key = example` when not.
+fn line(out: &mut String, comment: &str, key: &str, value: Option<String>, example: &str) {
+    out.push('\n');
+    out.push_str(comment);
+    out.push('\n');
+    match value {
+        Some(v) => out.push_str(&format!("{key} = {v}\n")),
+        None => out.push_str(&format!("# {key} = {example}\n")),
+    }
+}
+
+pub(crate) fn parse_bool(value: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Ok(true),
         "false" | "no" | "off" | "0" => Ok(false),
@@ -344,6 +465,53 @@ mod tests {
     fn quotes_are_stripped() {
         let cfg = Config::parse("download_dir = \"/tmp/books\"").unwrap();
         assert_eq!(cfg.download_dir, Some(PathBuf::from("/tmp/books")));
+    }
+
+    #[test]
+    fn a_populated_config_survives_a_render_round_trip() {
+        let original = Config::parse(
+            r#"
+            mirror = https://libgen.li, https://libgen.gl
+            download_dir = /tmp/books
+            limit = 50
+            topics = libgen, fiction
+            max_size = 2 GB
+            verify = false
+            allow_http = yes
+            reader = zathura
+            history = no
+            covers = off
+            "#,
+        )
+        .unwrap();
+
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(reparsed.mirrors, original.mirrors);
+        assert_eq!(reparsed.download_dir, original.download_dir);
+        assert_eq!(reparsed.limit, original.limit);
+        assert_eq!(reparsed.topics, original.topics);
+        assert_eq!(reparsed.max_size, original.max_size);
+        assert_eq!(reparsed.verify, original.verify);
+        assert_eq!(reparsed.allow_http, original.allow_http);
+        assert_eq!(reparsed.reader, original.reader);
+        assert_eq!(reparsed.history, original.history);
+        assert_eq!(reparsed.covers, original.covers);
+    }
+
+    #[test]
+    fn a_default_config_renders_to_all_defaults() {
+        // Every field is unset, so every line is a commented example: rendering
+        // and reparsing it yields the same empty defaults.
+        let rendered = Config::default().render();
+        let reparsed = Config::parse(&rendered).unwrap();
+        assert!(reparsed.mirrors.is_empty());
+        assert_eq!(reparsed.limit, None);
+        assert_eq!(reparsed.download_dir, None);
+        assert_eq!(reparsed.topics, None);
+        assert_eq!(reparsed.max_size, None);
+        assert_eq!(reparsed.verify, None);
+        assert!(!reparsed.allow_http);
+        assert_eq!(reparsed.reader, None);
     }
 
     #[test]
