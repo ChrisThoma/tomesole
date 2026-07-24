@@ -1,4 +1,4 @@
-//! clibgen — a small, careful command-line client for Library Genesis.
+//! tomesole — a small, careful command-line client for Library Genesis.
 //!
 //! Two things make this more than a `curl` wrapper, and both exist because
 //! Libgen is an unreliable, third-party-operated target:
@@ -78,7 +78,7 @@ fn run(argv: &[String], style: &Style) -> Result<i32> {
             Ok(0)
         }
         Command::Version => {
-            println!("clibgen {}", args::VERSION);
+            println!("tomesole {}", args::VERSION);
             Ok(0)
         }
         Command::Config { init, path } => cmd_config(*init, *path, style),
@@ -609,7 +609,7 @@ fn cmd_history(
     eprintln!(
         "\n  {}\n",
         style.dim(
-            "`clibgen open 1` to read the newest, `clibgen reveal 1` to show it in the file manager"
+            "`tomesole open 1` to read the newest, `tomesole reveal 1` to show it in the file manager"
         )
     );
     Ok(0)
@@ -705,7 +705,7 @@ fn cmd_config(init: bool, path_only: bool, style: &Style) -> Result<i32> {
                 "  {} no config yet at {}\n  {}\n",
                 style.dim("•"),
                 path.display(),
-                style.dim("run `clibgen config --init` to create one")
+                style.dim("run `tomesole config --init` to create one")
             );
             Ok(0)
         }
@@ -720,7 +720,7 @@ fn cmd_doctor(cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
         eprintln!("  {}  {value}", style.dim(&term::pad(label, 16)));
     };
 
-    eprintln!("\n  {}\n", style.bold("clibgen doctor"));
+    eprintln!("\n  {}\n", style.bold("tomesole doctor"));
     row("version", args::VERSION.to_string());
     row(
         "config",

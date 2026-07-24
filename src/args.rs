@@ -103,7 +103,7 @@ pub fn parse(argv: &[String]) -> Result<Cli> {
     let mut global = Global::default();
     let mut search = Search::default();
 
-    // Work out the subcommand. A bare `clibgen rust programming` is a search,
+    // Work out the subcommand. A bare `tomesole rust programming` is a search,
     // so anything that is not a known subcommand starts the query.
     let (command_name, rest) = split_command(argv);
 
@@ -337,7 +337,7 @@ pub fn parse(argv: &[String]) -> Result<Cli> {
             // is far more likely to be the start of a search.
             "--find" | "--match" => find = Some(take_value(&flag, &mut i)?),
 
-            other => bail!("unknown option `{other}` (try `clibgen --help`)"),
+            other => bail!("unknown option `{other}` (try `tomesole --help`)"),
         }
     }
 
@@ -380,14 +380,14 @@ pub fn parse(argv: &[String]) -> Result<Cli> {
             let md5 = positionals
                 .first()
                 .cloned()
-                .ok_or_else(|| err!("`get` needs an MD5, e.g. `clibgen get 1b915999…`"))?;
+                .ok_or_else(|| err!("`get` needs an MD5, e.g. `tomesole get 1b915999…`"))?;
             let md5 = extract_md5_argument(&md5)?;
             Command::Get { md5 }
         }
         _ => {
             // `search`, or a bare query.
             if positionals.is_empty() {
-                // Bare `clibgen` opens the interface. Callers that are not on a
+                // Bare `tomesole` opens the interface. Callers that are not on a
                 // terminal get help instead; `main` makes that call.
                 return Ok(Cli {
                     command: Command::Tui { query: None },
@@ -421,8 +421,8 @@ fn split_command(argv: &[String]) -> (Option<&str>, &[String]) {
 /// query rather than a command.
 ///
 /// All three are perfectly ordinary things to want a book about, so they only
-/// hold onto their meaning when what follows fits: `clibgen history` lists
-/// downloads, `clibgen history of the peloponnesian war` looks for a book. The
+/// hold onto their meaning when what follows fits: `tomesole history` lists
+/// downloads, `tomesole history of the peloponnesian war` looks for a book. The
 /// check runs after flag parsing, so a flag's value is never mistaken for a
 /// query word.
 fn is_really_a_query(command: Option<&str>, positionals: &[String]) -> bool {
@@ -490,21 +490,21 @@ pub fn help_text(style: &crate::term::Style) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{} {VERSION} — search and download from Library Genesis\n",
-        style.bold("clibgen")
+        style.bold("tomesole")
     ));
     let mut rows: Vec<(&str, &str)> = Vec::new();
 
     section(&mut out, style, "USAGE");
     rows.extend([
-        ("clibgen", "open the full-screen interface"),
-        ("clibgen <query>...", "search, then pick what to download"),
-        ("clibgen get <md5>", "download a file you already know"),
-        ("clibgen history", "list what has been downloaded"),
-        ("clibgen open [n]", "open a download in your reader"),
-        ("clibgen reveal [n]", "show a download in the file manager"),
-        ("clibgen mirrors", "show which mirrors are usable"),
-        ("clibgen config --init", "write a starter config file"),
-        ("clibgen doctor", "check the setup end to end"),
+        ("tomesole", "open the full-screen interface"),
+        ("tomesole <query>...", "search, then pick what to download"),
+        ("tomesole get <md5>", "download a file you already know"),
+        ("tomesole history", "list what has been downloaded"),
+        ("tomesole open [n]", "open a download in your reader"),
+        ("tomesole reveal [n]", "show a download in the file manager"),
+        ("tomesole mirrors", "show which mirrors are usable"),
+        ("tomesole config --init", "write a starter config file"),
+        ("tomesole doctor", "check the setup end to end"),
     ]);
     flush(&mut out, style, &mut rows, FLAG_WIDTH);
 
@@ -567,12 +567,12 @@ pub fn help_text(style: &crate::term::Style) -> String {
 
     section(&mut out, style, "EXAMPLES");
     for example in [
-        "clibgen the pragmatic programmer",
-        "clibgen -a \"Ursula K. Le Guin\" -e epub",
-        "clibgen author:herbert title:dune ext:epub",
-        "clibgen get 1b9159991f7fb1b3910c0be9ebf7e595",
-        "clibgen history -n 10",
-        "clibgen open 3 --with Preview",
+        "tomesole the pragmatic programmer",
+        "tomesole -a \"Ursula K. Le Guin\" -e epub",
+        "tomesole author:herbert title:dune ext:epub",
+        "tomesole get 1b9159991f7fb1b3910c0be9ebf7e595",
+        "tomesole history -n 10",
+        "tomesole open 3 --with Preview",
     ] {
         out.push_str(&format!("  {}\n", style.dim(example)));
     }
@@ -714,7 +714,7 @@ mod tests {
         );
     }
 
-    /// Bare `clibgen` opens the interface; `main` swaps in help when there is
+    /// Bare `tomesole` opens the interface; `main` swaps in help when there is
     /// no terminal to draw on.
     #[test]
     fn no_arguments_opens_the_interface() {

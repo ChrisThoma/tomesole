@@ -10,8 +10,8 @@
 //! le guin ext:epub year:1974
 //! ```
 //!
-//! The same syntax works in a bare CLI query, so `clibgen author:tolkien` and
-//! `clibgen --author tolkien` do the same thing.
+//! The same syntax works in a bare CLI query, so `tomesole author:tolkien` and
+//! `tomesole --author tolkien` do the same thing.
 //!
 //! A word that is not a recognised tag is left alone, so a title containing a
 //! colon — `Dune: Messiah`, `http://…` — searches for exactly what was typed.

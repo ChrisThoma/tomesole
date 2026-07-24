@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn resolving_makes_the_path_absolute() {
         let dir = std::env::temp_dir();
-        let file = dir.join(format!("clibgen-launch-{}.txt", std::process::id()));
+        let file = dir.join(format!("tomesole-launch-{}.txt", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
 
         let resolved = resolve(&file).unwrap();
@@ -220,10 +220,10 @@ mod tests {
     #[test]
     fn an_unknown_reader_fails_gracefully() {
         let dir = std::env::temp_dir();
-        let file = dir.join(format!("clibgen-launch-r-{}.txt", std::process::id()));
+        let file = dir.join(format!("tomesole-launch-r-{}.txt", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
 
-        let result = open(&file, Some("clibgen-no-such-application-9c1f"));
+        let result = open(&file, Some("tomesole-no-such-application-9c1f"));
         assert!(result.is_err(), "a bogus reader should not report success");
         let _ = std::fs::remove_file(&file);
     }

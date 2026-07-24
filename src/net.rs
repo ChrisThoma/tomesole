@@ -30,7 +30,7 @@ use crate::{bail, err};
 /// specific browser, only avoiding a default agent string that some mirrors
 /// reject outright.
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-     AppleWebKit/537.36 (KHTML, like Gecko) clibgen/0.1";
+     AppleWebKit/537.36 (KHTML, like Gecko) tomesole/0.1";
 
 /// Cap on HTML pages we parse, so a hostile mirror cannot exhaust memory.
 pub const MAX_PAGE_BYTES: u64 = 8 * 1024 * 1024;

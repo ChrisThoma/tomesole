@@ -414,7 +414,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "clibgen-history-{tag}-{}-{:?}",
+            "tomesole-history-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

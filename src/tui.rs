@@ -560,6 +560,12 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
     app.spawn_mirror_resolve(app.settings.refresh_mirrors);
 
     let mut terminal = ratatui::try_init()?;
+    // Name the window after us while the interface is up. A full-screen app
+    // never overwrites the title the shell last set — usually the launch
+    // command — so without this it just hangs there stale. We deliberately do
+    // not save and restore the prior title: the shell resets it at the next
+    // prompt, and that prior title is the very stale text we are replacing.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("tomesole"));
     let outcome = app.event_loop(&mut terminal, &rx);
     app.erase_cover();
     ratatui::try_restore()?;
@@ -1286,7 +1292,7 @@ impl App {
 
     /// Work out which entries the filter admits.
     ///
-    /// Matching is the same rule the `clibgen open` selector uses — title,
+    /// Matching is the same rule the `tomesole open` selector uses — title,
     /// author or filename, case-insensitively — so the two agree about what
     /// "dune" means.
     fn refilter(&mut self) {
@@ -1413,7 +1419,7 @@ impl App {
     /// Copy the focused book's MD5 to the system clipboard.
     ///
     /// The MD5 is the one handle that identifies a book everywhere — it is what
-    /// `clibgen get` takes, and how a book is quoted to someone else — so it is
+    /// `tomesole get` takes, and how a book is quoted to someone else — so it is
     /// the thing worth lifting out of the interface without reaching for a
     /// mouse. It goes out over OSC 52, the clipboard channel a terminal offers
     /// with no platform dependency: honoured by kitty, iTerm2, WezTerm, Ghostty
@@ -3470,7 +3476,7 @@ impl App {
             // surface rather than a hole cut in the screen.
             .style(Style::new().bg(theme::BG_ALT))
             .title(Span::styled(
-                " clibgen · keys ",
+                " tomesole · keys ",
                 Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
@@ -5102,14 +5108,14 @@ mod tests {
     }
 
     /// Render the app to styled HTML for out-of-terminal design review.
-    /// Dev-only: runs when CLIBGEN_PREVIEW_DIR is set, via `--ignored`.
+    /// Dev-only: runs when TOMESOLE_PREVIEW_DIR is set, via `--ignored`.
     #[test]
     #[ignore]
     fn dump_design_previews() {
         use ratatui::backend::TestBackend;
         use std::fmt::Write as _;
 
-        let Some(dir) = std::env::var_os("CLIBGEN_PREVIEW_DIR") else {
+        let Some(dir) = std::env::var_os("TOMESOLE_PREVIEW_DIR") else {
             return;
         };
         let dir = std::path::PathBuf::from(dir);
@@ -5218,7 +5224,7 @@ mod tests {
              h2{font-weight:600;margin:32px 0 8px} h2 small{color:#8892a4;font-weight:400}\
              pre{font:13px/1.15 'SF Mono',Menlo,monospace;display:inline-block;\
                  border-radius:8px;overflow:hidden;margin:0;box-shadow:0 8px 40px rgba(0,0,0,.5)}\
-             </style><h1>clibgen — TUI states</h1>",
+             </style><h1>tomesole — TUI states</h1>",
         );
 
         // 1. Wide search, cover art, one download running, one saved.

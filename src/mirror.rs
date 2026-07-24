@@ -244,7 +244,7 @@ impl Pool {
         }
 
         Err(err!(
-            "every mirror failed:\n{}\n\nTry `clibgen mirrors --refresh` to re-probe.",
+            "every mirror failed:\n{}\n\nTry `tomesole mirrors --refresh` to re-probe.",
             failures.join("\n")
         ))
     }

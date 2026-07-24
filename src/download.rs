@@ -525,7 +525,7 @@ fn mark_quarantined(path: &Path) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // flags;hex timestamp;agent name;event uuid
-    let value = format!("0081;{stamp:x};clibgen;");
+    let value = format!("0081;{stamp:x};tomesole;");
     let _ = xattr::set(path, "com.apple.quarantine", value.as_bytes());
 }
 
@@ -774,7 +774,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("clibgen-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tomesole-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

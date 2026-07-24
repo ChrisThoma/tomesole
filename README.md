@@ -1,4 +1,4 @@
-# clibgen
+# tomesole
 
 A terminal client for searching and downloading from Library Genesis, with both
 a full-screen interface and a scriptable CLI.
@@ -8,7 +8,7 @@ Most of the work here goes into those two problems: finding a mirror that
 actually works, and treating everything it sends back as hostile until proven
 otherwise.
 
-Run `clibgen` with no arguments for the full-screen interface. It has two tabs —
+Run `tomesole` with no arguments for the full-screen interface. It has two tabs —
 **Search** for finding books, **Library** for the ones you already have —
 and `Tab` (or `1`/`2`) moves between them from anywhere, including mid-search:
 
@@ -58,7 +58,7 @@ marked for a batch, the strip totals what they will pull (`3 marked · 24 MB`)
 before you commit. `y` lifts the highlighted book's MD5 onto the clipboard.
 
 The **Library** tab lists every book you have downloaded, newest first, and
-persists between sessions — it is a view onto `~/.local/share/clibgen/history.tsv`.
+persists between sessions — it is a view onto `~/.local/share/tomesole/history.tsv`.
 A strip under the box sums up the shelf at a glance — `12 books · 1.2 GB · 8
 epub · 3 pdf · 1 mobi` — and the same `s` sort orders it by title, author, size
 or when it was added. `⏎` opens the highlighted book in your reader, `f`
@@ -97,7 +97,7 @@ earlier search.
 The same thing from the CLI, for scripting and one-off grabs:
 
 ```
-$ clibgen --title "the rust programming language" -n 4
+$ tomesole --title "the rust programming language" -n 4
 
   4 results from libgen.li
 
@@ -157,7 +157,7 @@ real image signature, and a truncated or malformed book yields no cover rather
 than a crash.
 
 Detection is from the environment, never by writing a query escape and waiting
-for a reply — that races with the keyboard reader for the answer. `clibgen
+for a reply — that races with the keyboard reader for the answer. `tomesole
 doctor` reports which one it picked. `--no-covers`, or `covers = false` in the
 config, turns the whole thing off.
 
@@ -171,7 +171,7 @@ Every completed download is recorded — what it was, where it went, and whether
 it verified — so it can be found again later without going back to Libgen.
 
 ```
-$ clibgen history
+$ tomesole history
 
     #  Title                            Author           When         Size  Fmt
   ───  ───────────────────────────────  ───────────────  ───────  ────────  ─────
@@ -179,20 +179,20 @@ $ clibgen history
     2  The Dispossessed                 Ursula K. Le Gu… 3d ago     781 KB  epub
     3  The Rust Programming Language     Steve Klabnik   2026-06…  3.00 MB  pdf
 
-$ clibgen open 1                # in your reader
-$ clibgen reveal 1              # in Finder / your file manager
-$ clibgen open --with Preview 2
-$ clibgen open --find dispossessed
+$ tomesole open 1                # in your reader
+$ tomesole reveal 1              # in Finder / your file manager
+$ tomesole open --with Preview 2
+$ tomesole open --find dispossessed
 ```
 
-`clibgen open` with no argument takes the most recent. Inside the interface,
+`tomesole open` with no argument takes the most recent. Inside the interface,
 `h` shows the same list: `⏎` opens, `f` reveals, `d` forgets an entry without
 touching the file.
 
-The list is a table under `~/.local/share/clibgen/history.tsv`, mode `0600`,
+The list is a table under `~/.local/share/tomesole/history.tsv`, mode `0600`,
 capped at the last thousand downloads. A file that has since been moved or
 deleted stays listed and is marked as missing, rather than quietly vanishing.
-`clibgen history --clear` forgets everything, cached covers included; `history =
+`tomesole history --clear` forgets everything, cached covers included; `history =
 false` in the config stops it recording at all.
 
 Which application opens a book is `reader` in the config, or `--with`. On macOS
@@ -203,7 +203,7 @@ with the file as its argument (`zathura`). Unset means the system default.
 
 ```sh
 cargo build --release
-cp target/release/clibgen ~/.local/bin/
+cp target/release/tomesole ~/.local/bin/
 ```
 
 Needs Rust 1.85 or newer (2024 edition). No other build dependencies.
@@ -211,28 +211,28 @@ Needs Rust 1.85 or newer (2024 edition). No other build dependencies.
 ## Use
 
 ```sh
-clibgen                                   # full-screen interface
-clibgen tui dune                          # interface, query pre-filled
-clibgen dune                              # search, then pick
-clibgen -a "Ursula K. Le Guin" -e epub    # by author, EPUB only
-clibgen author:herbert title:dune         # the same, as tags
-clibgen -t "moby dick" --first            # take the top hit, no prompt
-clibgen --json -t dune --no-download      # machine-readable
-clibgen get 1b9159991f7fb1b3910c0be9ebf7e595
-clibgen history                           # what has been downloaded
-clibgen open 1                            # read the newest of them
-clibgen mirrors --refresh                 # which mirrors work right now
-clibgen doctor                            # check the whole setup
+tomesole                                   # full-screen interface
+tomesole tui dune                          # interface, query pre-filled
+tomesole dune                              # search, then pick
+tomesole -a "Ursula K. Le Guin" -e epub    # by author, EPUB only
+tomesole author:herbert title:dune         # the same, as tags
+tomesole -t "moby dick" --first            # take the top hit, no prompt
+tomesole --json -t dune --no-download      # machine-readable
+tomesole get 1b9159991f7fb1b3910c0be9ebf7e595
+tomesole history                           # what has been downloaded
+tomesole open 1                            # read the newest of them
+tomesole mirrors --refresh                 # which mirrors work right now
+tomesole doctor                            # check the whole setup
 ```
 
 `history`, `open` and `reveal` are also ordinary words to want a book about, so
-they only mean the command when what follows fits: `clibgen history` lists
-downloads, `clibgen history of the peloponnesian war` searches for one.
+they only mean the command when what follows fits: `tomesole history` lists
+downloads, `tomesole history of the peloponnesian war` searches for one.
 
 Selections accept single numbers, lists, and ranges: `3`, `1,4,7`, `2-5`.
 
-`clibgen config --init` writes a commented config file to
-`~/.config/clibgen/config.conf`. Flags always override it.
+`tomesole config --init` writes a commented config file to
+`~/.config/tomesole/config.conf`. Flags always override it.
 
 ## Finding a live mirror
 
@@ -244,7 +244,7 @@ development, three of the nine built-in mirrors were doing exactly that.
 So the health check runs a **real search and requires parseable results back**.
 A mirror counts as up only if it can do the thing it is needed for.
 
-In order, `clibgen`:
+In order, `tomesole`:
 
 1. uses mirrors you configured explicitly, without second-guessing them;
 2. falls back to a cached ranking from a probe in the last 6 hours;
@@ -256,7 +256,7 @@ The result is a pool, not a single pick. If the chosen mirror fails partway
 through, the next one is tried automatically.
 
 ```
-$ clibgen mirrors
+$ tomesole mirrors
 
   Mirror     Status    Detail
   ─────────  ────────  ────────────────────────────
@@ -366,7 +366,7 @@ One test is `#[ignore]`d because it needs the network: `cargo test -- --ignored
 covers_can_be_fetched` fetches real covers from a live mirror, which is how the
 hotlink protection on cover images was found in the first place. A second,
 `dump_design_previews`, renders the interface's main states to a styled HTML
-page for design review — set `CLIBGEN_PREVIEW_DIR` to somewhere writable and
+page for design review — set `TOMESOLE_PREVIEW_DIR` to somewhere writable and
 run it with `--ignored`.
 
 The TUI is tested through ratatui's off-screen backend: key handling, cover

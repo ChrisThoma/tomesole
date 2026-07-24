@@ -165,7 +165,7 @@ fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
 }
 
 pub fn config_dir() -> PathBuf {
-    xdg_dir("XDG_CONFIG_HOME", ".config").join("clibgen")
+    xdg_dir("XDG_CONFIG_HOME", ".config").join("tomesole")
 }
 
 pub fn config_path() -> PathBuf {
@@ -173,7 +173,7 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn cache_dir() -> PathBuf {
-    xdg_dir("XDG_CACHE_HOME", ".cache").join("clibgen")
+    xdg_dir("XDG_CACHE_HOME", ".cache").join("tomesole")
 }
 
 pub fn mirror_cache_path() -> PathBuf {
@@ -187,7 +187,7 @@ pub fn cover_cache_dir() -> PathBuf {
 
 /// Where state the user would miss lives, as opposed to state we can rebuild.
 pub fn data_dir() -> PathBuf {
-    xdg_dir("XDG_DATA_HOME", ".local/share").join("clibgen")
+    xdg_dir("XDG_DATA_HOME", ".local/share").join("tomesole")
 }
 
 pub fn history_path() -> PathBuf {
@@ -226,9 +226,9 @@ pub fn create_private_file(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("could not create {}", path.display()))
 }
 
-/// The commented template written by `clibgen config --init`.
+/// The commented template written by `tomesole config --init`.
 pub const TEMPLATE: &str = "\
-# clibgen configuration.
+# tomesole configuration.
 # Command-line flags override everything here.
 
 # Mirrors to try first, in order. Repeat the key or use a comma-separated list.
@@ -251,13 +251,13 @@ pub const TEMPLATE: &str = "\
 # Turning this off removes the only integrity check available. Don't.
 # verify = true
 
-# What `clibgen open` hands a book to. On macOS this is an application name,
+# What `tomesole open` hands a book to. On macOS this is an application name,
 # passed to `open -a`; elsewhere it is a command run with the file as its
 # argument. Unset means the system default for the file type.
 # reader = Books
 # reader = zathura
 
-# Keep a record of what has been downloaded, for `clibgen history`.
+# Keep a record of what has been downloaded, for `tomesole history`.
 # history = true
 
 # Fetch and draw cover art in the full-screen interface.

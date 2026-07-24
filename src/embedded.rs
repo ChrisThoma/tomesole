@@ -477,13 +477,13 @@ mod tests {
         assert!(cover_from_bytes(&[0xFF; 500], "mobi").is_none());
     }
 
-    /// Extract a cover from a real book file named in `CLIBGEN_COVER_FILE`,
-    /// writing it beside `CLIBGEN_PREVIEW_DIR` — a hand check against files the
+    /// Extract a cover from a real book file named in `TOMESOLE_COVER_FILE`,
+    /// writing it beside `TOMESOLE_PREVIEW_DIR` — a hand check against files the
     /// repo cannot carry. `cargo test -- --ignored extracts_from_a_real_file`.
     #[test]
     #[ignore]
     fn extracts_from_a_real_file() {
-        let Some(path) = std::env::var_os("CLIBGEN_COVER_FILE") else {
+        let Some(path) = std::env::var_os("TOMESOLE_COVER_FILE") else {
             return;
         };
         let path = std::path::PathBuf::from(path);
@@ -493,7 +493,7 @@ mod tests {
             "a real jacket is more than a thumbnail: {} bytes",
             cover.encoded.len()
         );
-        if let Some(dir) = std::env::var_os("CLIBGEN_PREVIEW_DIR") {
+        if let Some(dir) = std::env::var_os("TOMESOLE_PREVIEW_DIR") {
             let out = std::path::PathBuf::from(dir).join("rust_extracted_cover.jpg");
             std::fs::write(&out, &cover.encoded).unwrap();
             eprintln!("wrote {} ({} bytes)", out.display(), cover.encoded.len());

@@ -1,8 +1,8 @@
 [package]
-name = "clibgen"
+name = "tomesole"
 version = "0.1.0"
 edition = "2024"
-description = "A clean, safe CLI for searching and downloading from Library Genesis"
+description = "A clean, safe TUI for searching and downloading from Library Genesis"
 license = "MIT"
 readme = "README.md"
 
