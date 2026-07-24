@@ -27,6 +27,62 @@ use crate::model::{Book, SearchQuery, human_bytes};
 use crate::net::Http;
 use crate::{Settings, cover, download, history, launch, libgen, mirror, net, query};
 
+/// The visual language, in one place so the whole interface stays coherent.
+///
+/// One accent does the identifying — a calm teal that reads as "clibgen"
+/// wherever it appears — with a warm amber kept in reserve for the few things
+/// genuinely worth the eye: a file's format, the count of books you own. Text
+/// lives on three levels, primary through faint, so hierarchy comes from weight
+/// and not from a rainbow. Colours are true-colour on purpose: the interface
+/// commits to a look rather than inheriting whatever sixteen colours the
+/// terminal happened to be set to.
+mod theme {
+    use ratatui::style::{Color, Modifier, Style};
+
+    pub const ACCENT: Color = Color::Rgb(94, 200, 205); // teal
+    pub const ACCENT_DEEP: Color = Color::Rgb(58, 138, 142);
+    pub const AMBER: Color = Color::Rgb(228, 184, 112);
+    pub const TEXT: Color = Color::Rgb(228, 231, 236);
+    pub const MUTED: Color = Color::Rgb(150, 158, 170);
+    pub const FAINT: Color = Color::Rgb(94, 101, 114);
+    pub const SUCCESS: Color = Color::Rgb(126, 199, 138);
+    pub const DANGER: Color = Color::Rgb(230, 112, 120);
+    /// The wash behind the highlighted row: a dark teal tint, dim enough to sit
+    /// under white text yet plainly not the background.
+    pub const SELECT_BG: Color = Color::Rgb(28, 46, 51);
+
+    /// The gutter that marks the selected row. A solid bar reads as "here" even
+    /// when the list holds a single item, which a mere background tint does not.
+    pub const CURSOR: &str = "▌ ";
+
+    pub fn text() -> Style {
+        Style::new().fg(TEXT)
+    }
+    pub fn muted() -> Style {
+        Style::new().fg(MUTED)
+    }
+    pub fn faint() -> Style {
+        Style::new().fg(FAINT)
+    }
+    pub fn accent() -> Style {
+        Style::new().fg(ACCENT)
+    }
+
+    /// The whole selected row. Cells that set their own colour keep it; the
+    /// tint and the accent gutter come from here.
+    pub fn selected_row() -> Style {
+        Style::new()
+            .bg(SELECT_BG)
+            .fg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// A column header: quiet, so the data below it does the talking.
+    pub fn header() -> Style {
+        Style::new().fg(ACCENT_DEEP).add_modifier(Modifier::BOLD)
+    }
+}
+
 /// Messages the UI thread waits on.
 enum Ev {
     Key(KeyEvent),
@@ -1092,17 +1148,19 @@ impl App {
 
     /// How tall the detail pane is, borders included.
     ///
-    /// A cover needs more room than five lines of text, but only when there is
-    /// one to show, and never so much that the results list is squeezed out.
+    /// A cover needs more room than the six lines of text, but only when there
+    /// is one to show, and never so much that the results list is squeezed out.
     fn details_height(&self, area: Rect) -> u16 {
-        let plain = 7;
+        let plain = 8u16;
+        // Leave the list at least four rows plus its header, whatever else we
+        // do — the details pane must never crowd out the results.
+        let ceiling = area.height.saturating_sub(3 + 1 + 5).max(3);
+        let floor = plain.min(ceiling);
         if !self.cover_visible() {
-            return plain;
+            return floor;
         }
         let wanted = 13;
-        // Leave the list at least four rows plus its header.
-        let spare = area.height.saturating_sub(3 + 1 + 5);
-        wanted.min(spare).max(plain)
+        wanted.min(area.height.saturating_sub(3 + 1 + 5)).max(floor)
     }
 
     /// Where the picture goes, in screen coordinates.
@@ -1146,104 +1204,116 @@ impl App {
     /// a line of results not shown.
     fn render_input(&self, frame: &mut Frame, area: Rect) {
         let editing = self.mode == Mode::Editing;
-        let accent = if editing {
-            Color::Cyan
+        // The box border lights up in the accent while you type, and rests at
+        // faint otherwise — a quiet cue for where the keyboard is going.
+        let border = if editing {
+            theme::ACCENT
         } else {
-            Color::DarkGray
+            theme::FAINT
         };
 
         let tab = |label: &str, count: Option<usize>, active: bool| {
             let text = match count {
-                Some(n) => format!(" {label} {n} "),
-                None => format!(" {label} "),
+                Some(n) => format!("  {label} {n}  "),
+                None => format!("  {label}  "),
             };
             Span::styled(
                 text,
                 if active {
-                    // Reversed rather than merely coloured: which tab you are
-                    // on should be obvious without relying on colour at all.
-                    Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+                    // The active tab is a solid accent chip: colour and reverse
+                    // together, so it is unmistakable even without truecolour.
+                    Style::new()
+                        .fg(Color::Rgb(18, 24, 28))
+                        .bg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(Color::DarkGray)
+                    theme::faint()
                 },
             )
         };
 
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(accent))
+            .border_style(Style::new().fg(border))
             .title(Line::from(vec![
-                tab("1 Search", None, self.tab == Tab::Search),
+                tab("1 SEARCH", None, self.tab == Tab::Search),
                 Span::raw(" "),
-                tab("2 Library", Some(self.library.len()), self.tab == Tab::Library),
+                tab("2 LIBRARY", Some(self.library.len()), self.tab == Tab::Library),
             ]))
             .title_top(
-                Line::from(Span::styled(
-                    match self.tab {
-                        Tab::Search => format!(" {} ", self.mirror_label),
-                        // The mirror is irrelevant to books already on disk.
-                        Tab::Library => " on this machine ".to_string(),
-                    },
-                    Style::new().fg(Color::DarkGray),
-                ))
+                Line::from(vec![
+                    Span::styled("● ", match self.tab {
+                        // A green dot when a mirror is answering, amber while we
+                        // are still looking — status you can read at a glance.
+                        Tab::Search if !self.mirrors.is_empty() => theme::accent(),
+                        Tab::Search => Style::new().fg(theme::AMBER),
+                        Tab::Library => theme::accent(),
+                    }),
+                    Span::styled(
+                        match self.tab {
+                            Tab::Search => format!("{} ", self.mirror_label),
+                            // The mirror is irrelevant to books already on disk.
+                            Tab::Library => "on this machine ".to_string(),
+                        },
+                        theme::muted(),
+                    ),
+                ])
                 .right_aligned(),
             );
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let prompt = Span::styled(
+            if editing { "❯ " } else { "  " },
+            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        );
         let text = if self.input().is_empty() && !editing {
             Span::styled(
                 match self.tab {
                     Tab::Search => "press / to search Library Genesis",
                     Tab::Library => "press / to filter your books",
                 },
-                Style::new().fg(Color::DarkGray),
+                theme::faint(),
             )
         } else {
-            Span::raw(self.input())
+            Span::styled(self.input().to_string(), theme::text())
         };
-        frame.render_widget(Paragraph::new(Line::from(text)), inner);
+        frame.render_widget(Paragraph::new(Line::from(vec![prompt, text])), inner);
 
         if editing {
-            // Place the real terminal cursor so it blinks in the right column.
-            let offset: usize = self
+            // Place the real terminal cursor so it blinks in the right column,
+            // past the two-cell "❯ " prompt.
+            let offset: usize = 2 + self
                 .input()
                 .chars()
                 .take(self.caret)
                 .map(|c| crate::term::display_width(&c.to_string()))
-                .sum();
+                .sum::<usize>();
             frame.set_cursor_position((inner.x + offset as u16, inner.y));
         }
     }
 
     fn render_results(&mut self, frame: &mut Frame, area: Rect) {
         if self.results.is_empty() {
-            let message = if self.busy {
-                format!("  {}…", self.status)
-            } else {
-                format!("  {}", self.status)
-            };
-            frame.render_widget(
-                Paragraph::new(message).style(Style::new().fg(Color::DarkGray)),
-                area,
-            );
+            self.render_empty(frame, area);
             return;
         }
 
         let header = Row::new([
             Cell::from(""),
-            Cell::from("Title"),
-            Cell::from("Author"),
-            Cell::from("Year"),
-            Cell::from("Lang"),
-            Cell::from("Size"),
-            Cell::from("Fmt"),
-            Cell::from("Status"),
+            Cell::from("TITLE"),
+            Cell::from("AUTHOR"),
+            Cell::from("YEAR"),
+            Cell::from("LANG"),
+            Cell::from("SIZE"),
+            Cell::from("FMT"),
+            Cell::from("STATUS"),
         ])
-        .style(Style::new().fg(Color::DarkGray))
+        .style(theme::header())
         .height(1);
 
+        let selected = self.table.selected();
         let rows: Vec<Row> = self
             .results
             .iter()
@@ -1252,12 +1322,12 @@ impl App {
                 let marked = self.marked.get(i).copied().unwrap_or(false);
                 let job = self.jobs.get(&book.md5);
                 let (marker, marker_style) = match job {
-                    Some(Job::Saved(_)) => ("✓", Style::new().fg(Color::Green)),
-                    Some(Job::Failed(_)) => ("✗", Style::new().fg(Color::Red)),
+                    Some(Job::Saved(_)) => ("✓", Style::new().fg(theme::SUCCESS)),
+                    Some(Job::Failed(_)) => ("✗", Style::new().fg(theme::DANGER)),
                     Some(Job::Running { .. }) | Some(Job::Queued) => {
-                        ("↓", Style::new().fg(Color::Cyan))
+                        ("↓", Style::new().fg(theme::ACCENT))
                     }
-                    None if marked => ("•", Style::new().fg(Color::Cyan)),
+                    None if marked => ("●", Style::new().fg(theme::AMBER)),
                     None => (" ", Style::new()),
                 };
 
@@ -1266,16 +1336,22 @@ impl App {
                     all.split(';').next().unwrap_or(all).trim().to_string()
                 };
 
+                // The highlighted title turns full-white and bold; the rest sit
+                // one step down so the cursor row plainly leads.
+                let title_style = if Some(i) == selected {
+                    theme::text().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::muted()
+                };
+
                 Row::new([
                     Cell::from(marker).style(marker_style),
-                    Cell::from(book.title.clone()),
-                    Cell::from(author).style(Style::new().fg(Color::Gray)),
-                    Cell::from(book.year.clone().unwrap_or_default())
-                        .style(Style::new().fg(Color::DarkGray)),
-                    Cell::from(book.language.clone().unwrap_or_default())
-                        .style(Style::new().fg(Color::DarkGray)),
-                    Cell::from(book.size_human()).style(Style::new().fg(Color::DarkGray)),
-                    Cell::from(book.ext().to_string()).style(Style::new().fg(Color::Green)),
+                    Cell::from(book.title.clone()).style(title_style),
+                    Cell::from(author).style(theme::muted()),
+                    Cell::from(book.year.clone().unwrap_or_default()).style(theme::faint()),
+                    Cell::from(book.language.clone().unwrap_or_default()).style(theme::faint()),
+                    Cell::from(book.size_human()).style(theme::faint()),
+                    Cell::from(book.ext().to_string()).style(Style::new().fg(theme::AMBER)),
                     Cell::from(job_label(job)).style(job_style(job)),
                 ])
             })
@@ -1296,16 +1372,41 @@ impl App {
         )
         .header(header)
         .column_spacing(1)
-        .row_highlight_style(Style::new().bg(Color::Indexed(236)).bold())
-        .highlight_symbol("");
+        .row_highlight_style(theme::selected_row())
+        .highlight_symbol(theme::CURSOR);
 
         frame.render_stateful_widget(table, area, &mut self.table);
+    }
+
+    /// The results area before or between searches: the status, and once a
+    /// mirror is up, a few words on how to begin. Centred rather than tucked in
+    /// a corner, so an empty screen still looks composed.
+    fn render_empty(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = vec![Line::from(Span::styled(
+            self.status.clone() + if self.busy { "…" } else { "" },
+            theme::muted(),
+        ))];
+        if !self.busy && self.results.is_empty() && self.mode != Mode::Editing {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "press / and type a title or author",
+                theme::faint(),
+            )));
+        }
+        let block = area.inner(Margin {
+            horizontal: 2,
+            vertical: area.height.saturating_sub(lines.len() as u16) / 2,
+        });
+        frame.render_widget(
+            Paragraph::new(lines).alignment(Alignment::Center),
+            block,
+        );
     }
 
     fn render_details(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::DarkGray));
+            .border_style(Style::new().fg(theme::FAINT));
         let whole = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1338,9 +1439,9 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| "no selection".to_string());
             let style = if self.error.is_some() {
-                Style::new().fg(Color::Red)
+                Style::new().fg(theme::DANGER)
             } else {
-                Style::new().fg(Color::DarkGray)
+                theme::faint()
             };
             frame.render_widget(
                 Paragraph::new(hint).style(style).wrap(Wrap { trim: true }),
@@ -1367,54 +1468,51 @@ impl App {
         let mut lines = vec![
             Line::from(Span::styled(
                 book.title.clone(),
-                Style::new().fg(Color::White).bold(),
+                theme::text().add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 book.authors_or_unknown().to_string(),
-                Style::new().fg(Color::Gray),
+                theme::muted(),
             )),
-            Line::from(Span::styled(
-                format!("md5 {}", book.md5),
-                Style::new().fg(Color::DarkGray),
-            )),
+            Line::from(vec![
+                Span::styled("md5 ", theme::faint()),
+                Span::styled(book.md5.clone(), theme::faint()),
+            ]),
         ];
         let facts = facts.join("  ·  ");
         if !facts.trim().is_empty() {
-            lines.insert(
-                2,
-                Line::from(Span::styled(facts, Style::new().fg(Color::DarkGray))),
-            );
+            lines.insert(2, Line::from(Span::styled(facts, theme::muted())));
         }
 
-        // The most urgent thing about the selection goes last, where the eye
-        // lands: an error, else this file's download state.
+        // A blank line, then the most urgent thing about the selection, where
+        // the eye lands: an error, else this file's download state.
+        lines.push(Line::from(""));
         if let Some(error) = &self.error {
             lines.push(Line::from(Span::styled(
                 error.clone(),
-                Style::new().fg(Color::Red),
+                Style::new().fg(theme::DANGER),
             )));
         } else {
             match self.jobs.get(&book.md5) {
                 Some(Job::Saved(name)) => lines.push(Line::from(Span::styled(
                     format!("✓ saved as {name} — MD5 verified"),
-                    Style::new().fg(Color::Green),
+                    Style::new().fg(theme::SUCCESS),
                 ))),
                 Some(Job::Failed(e)) => lines.push(Line::from(Span::styled(
                     format!("✗ {e}"),
-                    Style::new().fg(Color::Red),
+                    Style::new().fg(theme::DANGER),
                 ))),
                 Some(Job::Running { done, total }) => lines.push(Line::from(Span::styled(
                     progress_bar(*done, *total, 28),
-                    Style::new().fg(Color::Cyan),
+                    Style::new().fg(theme::ACCENT),
                 ))),
-                Some(Job::Queued) => lines.push(Line::from(Span::styled(
-                    "queued",
-                    Style::new().fg(Color::DarkGray),
-                ))),
-                None => lines.push(Line::from(Span::styled(
-                    self.settings.dest_dir.display().to_string(),
-                    Style::new().fg(Color::DarkGray),
-                ))),
+                Some(Job::Queued) => {
+                    lines.push(Line::from(Span::styled("queued", theme::faint())))
+                }
+                None => lines.push(Line::from(vec![
+                    Span::styled("⏎ download → ", theme::accent()),
+                    Span::styled(self.settings.dest_dir.display().to_string(), theme::faint()),
+                ])),
             }
         }
 
@@ -1439,7 +1537,9 @@ impl App {
         {
             Some(Slot::Looking) => {
                 frame.render_widget(
-                    Paragraph::new("…").style(Style::new().fg(Color::DarkGray)),
+                    Paragraph::new("…")
+                        .style(theme::faint())
+                        .alignment(Alignment::Center),
                     area,
                 );
             }
@@ -1476,51 +1576,44 @@ impl App {
     /// Every book downloaded so far, filtered by whatever is in the box.
     fn render_library(&mut self, frame: &mut Frame, area: Rect) {
         if self.shown.is_empty() {
-            // An empty library and an over-narrow filter are different problems
-            // and deserve different sentences.
-            let message = if self.library.is_empty() {
-                "  Nothing here yet.\n\n  Books you download appear in this tab, and stay here\n  between sessions. Press Tab to search for one."
-                    .to_string()
-            } else {
-                format!(
-                    "  No book matches “{}” — ^u clears the filter.",
-                    self.filter.trim()
-                )
-            };
-            frame.render_widget(
-                Paragraph::new(message).style(Style::new().fg(Color::DarkGray)),
-                area,
-            );
+            self.render_empty_library(frame, area);
             return;
         }
         let now = history::now();
 
         let header = Row::new([
             Cell::from(""),
-            Cell::from("Title"),
-            Cell::from("Author"),
-            Cell::from("When"),
-            Cell::from("Size"),
-            Cell::from("Fmt"),
+            Cell::from("TITLE"),
+            Cell::from("AUTHOR"),
+            Cell::from("ADDED"),
+            Cell::from("SIZE"),
+            Cell::from("FMT"),
         ])
-        .style(Style::new().fg(Color::DarkGray))
+        .style(theme::header())
         .height(1);
 
+        let selected = self.library_table.selected();
         let rows: Vec<Row> = self
             .shown
             .iter()
-            .filter_map(|&i| self.library.get(i))
-            .map(|entry| {
+            .enumerate()
+            .filter_map(|(row, &i)| self.library.get(i).map(|e| (row, e)))
+            .map(|(row, entry)| {
                 let present = entry.present();
+                let here = Some(row) == selected;
+                // A present book leads with a small dot; a missing one with a
+                // warning, and everything about its row reads as unavailable.
                 let (marker, marker_style) = if present {
-                    ("", Style::new())
+                    ("•", theme::faint())
                 } else {
-                    ("!", Style::new().fg(Color::Red))
+                    ("!", Style::new().fg(theme::DANGER))
                 };
-                let title_style = if present {
-                    Style::new()
+                let title_style = if !present {
+                    theme::faint()
+                } else if here {
+                    theme::text().add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(Color::DarkGray)
+                    theme::text()
                 };
                 let title = if present {
                     entry.title.clone()
@@ -1531,14 +1624,13 @@ impl App {
                 Row::new([
                     Cell::from(marker).style(marker_style),
                     Cell::from(title).style(title_style),
-                    Cell::from(entry.first_author()).style(Style::new().fg(Color::Gray)),
-                    Cell::from(history::when(entry.at, now))
-                        .style(Style::new().fg(Color::DarkGray)),
-                    Cell::from(human_bytes(entry.size)).style(Style::new().fg(Color::DarkGray)),
+                    Cell::from(entry.first_author()).style(theme::muted()),
+                    Cell::from(history::when(entry.at, now)).style(theme::faint()),
+                    Cell::from(human_bytes(entry.size)).style(theme::faint()),
                     Cell::from(entry.ext().to_string()).style(if present {
-                        Style::new().fg(Color::Green)
+                        Style::new().fg(theme::AMBER)
                     } else {
-                        Style::new().fg(Color::DarkGray)
+                        theme::faint()
                     }),
                 ])
             })
@@ -1557,17 +1649,61 @@ impl App {
         )
         .header(header)
         .column_spacing(1)
-        .row_highlight_style(Style::new().bg(Color::Indexed(236)).bold())
-        .highlight_symbol("");
+        .row_highlight_style(theme::selected_row())
+        .highlight_symbol(theme::CURSOR);
 
         frame.render_stateful_widget(table, area, &mut self.library_table);
+    }
+
+    /// An empty library and an over-narrow filter are different problems and
+    /// deserve different words; both are centred so the tab looks intended
+    /// rather than broken.
+    fn render_empty_library(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = if self.library.is_empty() {
+            vec![
+                Line::from(Span::styled(
+                    "Your library is empty",
+                    theme::text().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Books you download land here and stay between sessions.",
+                    theme::muted(),
+                )),
+                Line::from(vec![
+                    Span::styled("Press ", theme::faint()),
+                    Span::styled("Tab", theme::accent()),
+                    Span::styled(" to go and find one.", theme::faint()),
+                ]),
+            ]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    format!("No book matches “{}”", self.filter.trim()),
+                    theme::muted(),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("^u", theme::accent()),
+                    Span::styled(" clears the filter", theme::faint()),
+                ]),
+            ]
+        };
+        let block = area.inner(Margin {
+            horizontal: 2,
+            vertical: area.height.saturating_sub(lines.len() as u16) / 2,
+        });
+        frame.render_widget(
+            Paragraph::new(lines).alignment(Alignment::Center),
+            block,
+        );
     }
 
     /// Where the highlighted book went, and whether it is still there.
     fn render_library_details(&self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::DarkGray));
+            .border_style(Style::new().fg(theme::FAINT));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1578,80 +1714,122 @@ impl App {
                 .unwrap_or_else(|| "⏎ opens a book in your reader".to_string());
             frame.render_widget(
                 Paragraph::new(hint)
-                    .style(Style::new().fg(if self.error.is_some() {
-                        Color::Red
+                    .style(if self.error.is_some() {
+                        Style::new().fg(theme::DANGER)
                     } else {
-                        Color::DarkGray
-                    }))
+                        theme::faint()
+                    })
                     .wrap(Wrap { trim: true }),
                 inner,
             );
             return;
         };
 
+        let verified = if entry.verified {
+            Span::styled("✓ MD5 verified", Style::new().fg(theme::SUCCESS))
+        } else {
+            Span::styled("unverified", theme::faint())
+        };
         let mut lines = vec![
             Line::from(Span::styled(
                 entry.title.clone(),
-                Style::new().fg(Color::White).bold(),
+                theme::text().add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 entry.authors.clone().unwrap_or_default(),
-                Style::new().fg(Color::Gray),
+                theme::muted(),
             )),
-            Line::from(Span::styled(
-                entry.path.display().to_string(),
-                Style::new().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                format!(
-                    "{}  ·  {}  ·  {}",
-                    history::timestamp(entry.at),
-                    human_bytes(entry.size),
-                    if entry.verified {
-                        "MD5 verified"
-                    } else {
-                        "unverified"
-                    }
+            Line::from(Span::styled(entry.path.display().to_string(), theme::faint())),
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{}  ·  {}  ·  ",
+                        history::timestamp(entry.at),
+                        human_bytes(entry.size),
+                    ),
+                    theme::muted(),
                 ),
-                Style::new().fg(Color::DarkGray),
-            )),
+                verified,
+            ]),
+            Line::from(""),
         ];
 
         if let Some(error) = &self.error {
             lines.push(Line::from(Span::styled(
                 error.clone(),
-                Style::new().fg(Color::Red),
+                Style::new().fg(theme::DANGER),
             )));
         } else if !entry.present() {
             lines.push(Line::from(Span::styled(
-                "the file is no longer there — d to forget it",
-                Style::new().fg(Color::Red),
+                "⚠ the file is no longer there — press d to forget it",
+                Style::new().fg(theme::DANGER),
             )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("⏎ open", theme::accent()),
+                Span::styled("   f reveal in file manager", theme::faint()),
+            ]));
         }
 
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
     fn render_hints(&self, frame: &mut Frame, area: Rect) {
-        // `tab` leads every line: it is the one key that gets you out of
-        // wherever you are, and the one people need told.
-        let hints = match (self.mode, self.tab) {
-            (Mode::Help, _) => "any key to close",
-            (Mode::Editing, Tab::Search) => {
-                "tab library   ⏎ search   esc done   ^u clear   try author: title: ext:"
-            }
-            (Mode::Editing, Tab::Library) => "tab search   esc done   ^u clear   filtering as you type",
-            (Mode::Browsing, Tab::Search) => {
-                "tab library   ↑↓ move   space mark   ⏎ download   o open   / search   ? help   q quit"
-            }
-            (Mode::Browsing, Tab::Library) => {
-                "tab search   ↑↓ move   ⏎ open   f reveal   / filter   d forget   ? help   q quit"
-            }
+        // Each hint is a (key, label) pair; the key rides in the accent, the
+        // label sits faint beneath it, so the bar reads as a legend rather than
+        // a grey sentence. `tab` leads every line — it is the one key that gets
+        // you out of wherever you are.
+        let hints: &[(&str, &str)] = match (self.mode, self.tab) {
+            (Mode::Help, _) => &[("", "any key to close")],
+            (Mode::Editing, Tab::Search) => &[
+                ("tab", "library"),
+                ("⏎", "search"),
+                ("esc", "done"),
+                ("^u", "clear"),
+                ("", "try author: title: ext:"),
+            ],
+            (Mode::Editing, Tab::Library) => &[
+                ("tab", "search"),
+                ("esc", "done"),
+                ("^u", "clear"),
+                ("", "filtering as you type"),
+            ],
+            (Mode::Browsing, Tab::Search) => &[
+                ("tab", "library"),
+                ("↑↓", "move"),
+                ("space", "mark"),
+                ("⏎", "download"),
+                ("o", "open"),
+                ("/", "search"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            (Mode::Browsing, Tab::Library) => &[
+                ("tab", "search"),
+                ("↑↓", "move"),
+                ("⏎", "open"),
+                ("f", "reveal"),
+                ("/", "filter"),
+                ("d", "forget"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
         };
-        frame.render_widget(
-            Paragraph::new(format!(" {hints}")).style(Style::new().fg(Color::DarkGray)),
-            area,
-        );
+
+        let mut spans = vec![Span::raw(" ")];
+        for (key, label) in hints {
+            if !key.is_empty() {
+                spans.push(Span::styled(
+                    (*key).to_string(),
+                    theme::accent().add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(format!(" {label}"), theme::faint()));
+            } else {
+                spans.push(Span::styled((*label).to_string(), theme::faint()));
+            }
+            spans.push(Span::styled("   ", theme::faint()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_help(&self, frame: &mut Frame) {
@@ -1694,43 +1872,53 @@ impl App {
             ),
         ];
 
+        // A section header sits in amber above its keys, with a blank line
+        // before it (except the first) so the groups breathe.
+        let section_title = |title: &str, first: bool| {
+            let text = if first {
+                title.to_uppercase()
+            } else {
+                format!("\n{}", title.to_uppercase())
+            };
+            Line::from(Span::styled(
+                text,
+                Style::new()
+                    .fg(theme::AMBER)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        };
+        let key_row = |keys: &str, what: &str| {
+            Line::from(vec![
+                Span::styled(format!("  {keys:<11}"), theme::accent()),
+                Span::styled(what.to_string(), theme::muted()),
+            ])
+        };
+
         let lines: Vec<Line> = sections
             .iter()
-            .flat_map(|(title, keys)| {
-                std::iter::once(Line::from(Span::styled(
-                    (*title).to_string(),
-                    Style::new().fg(Color::DarkGray),
-                )))
-                .chain(keys.iter().map(|(keys, what)| {
-                    Line::from(vec![
-                        Span::styled(format!("{keys:<11}"), Style::new().fg(Color::Cyan)),
-                        Span::styled((*what).to_string(), Style::new().fg(Color::Gray)),
-                    ])
-                }))
+            .enumerate()
+            .flat_map(|(s, (title, keys))| {
+                std::iter::once(section_title(title, s == 0))
+                    .chain(keys.iter().map(|(k, what)| key_row(k, what)))
             })
             // The search box takes tags as well as words, and this is the only
             // place that says so.
-            .chain(std::iter::once(Line::from(Span::styled(
-                "search tags",
-                Style::new().fg(Color::DarkGray),
-            ))))
-            .chain(query::TAGS.iter().map(|(tag, what)| {
-                Line::from(vec![
-                    Span::styled(format!("{tag:<11}"), Style::new().fg(Color::Cyan)),
-                    Span::styled((*what).to_string(), Style::new().fg(Color::Gray)),
-                ])
-            }))
+            .chain(std::iter::once(section_title("search tags", false)))
+            .chain(query::TAGS.iter().map(|(tag, what)| key_row(tag, what)))
             .collect();
 
-        let width = 58u16.min(frame.area().width.saturating_sub(4));
+        let width = 60u16.min(frame.area().width.saturating_sub(4));
         let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
         let area = centered(frame.area(), width, height);
 
         frame.render_widget(Clear, area);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::Cyan))
-            .title(Span::styled(" keys ", Style::new().fg(Color::Cyan).bold()));
+            .border_style(Style::new().fg(theme::ACCENT))
+            .title(Span::styled(
+                " clibgen · keys ",
+                Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(lines), inner);
@@ -1764,9 +1952,9 @@ fn job_label(job: Option<&Job>) -> String {
 
 fn job_style(job: Option<&Job>) -> Style {
     match job {
-        Some(Job::Saved(_)) => Style::new().fg(Color::Green),
-        Some(Job::Failed(_)) => Style::new().fg(Color::Red),
-        Some(_) => Style::new().fg(Color::Cyan),
+        Some(Job::Saved(_)) => Style::new().fg(theme::SUCCESS),
+        Some(Job::Failed(_)) => Style::new().fg(theme::DANGER),
+        Some(_) => Style::new().fg(theme::ACCENT),
         None => Style::new(),
     }
 }
@@ -2129,7 +2317,7 @@ mod tests {
         a.table.select(Some(0));
 
         let screen = draw(&mut a, 100, 24);
-        assert!(screen.contains("Search"), "tab bar missing: {screen}");
+        assert!(screen.contains("SEARCH"), "tab bar missing: {screen}");
         assert!(screen.contains("libgen.li"), "{screen}");
         assert!(screen.contains("The Rust Programming Language"), "{screen}");
         assert!(screen.contains("Klabnik"), "{screen}");
@@ -2343,9 +2531,9 @@ mod tests {
         press(&mut a, KeyCode::Char('d'));
         assert_eq!(a.library_table.selected(), None);
         let screen = draw(&mut a, 80, 20);
-        assert!(screen.contains("Nothing here yet"), "{screen}");
+        assert!(screen.contains("library is empty"), "{screen}");
         // It points the way out rather than leaving a dead end.
-        assert!(screen.contains("Tab to search"), "{screen}");
+        assert!(screen.contains("Tab"), "{screen}");
     }
 
     #[test]
@@ -2353,10 +2541,10 @@ mod tests {
         let mut a = app();
         a.library = entries(4);
         let screen = draw(&mut a, 100, 24);
-        assert!(screen.contains("Search"), "{screen}");
-        assert!(screen.contains("Library"), "{screen}");
+        assert!(screen.contains("SEARCH"), "{screen}");
+        assert!(screen.contains("LIBRARY"), "{screen}");
         // The count rides along in the tab label so it is visible before you go.
-        assert!(screen.contains("Library 4"), "{screen}");
+        assert!(screen.contains("LIBRARY 4"), "{screen}");
     }
 
     #[test]

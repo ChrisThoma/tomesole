@@ -13,22 +13,27 @@ Run `clibgen` with no arguments for the full-screen interface. It has two tabs �
 and `Tab` (or `1`/`2`) moves between them from anywhere, including mid-search:
 
 ```
-╭ 1 Search   2 Library 12 ────────────────────────────────── libgen.li ╮
-│author:herbert title:dune                                            │
-╰─────────────────────────────────────────────────────────────────────╯
-  Title                          Author           Year Lang    Size   Fmt
-  Dune 1                         Frank Herbert         French  781 KB epub
-  Sisterhood of Dune             Brian Herbert    2012 English 1000 KB epub
-  Heretics of Dune               Frank Herbert    1984 English  937 KB azw3
-╭─────────────────────────────────────────────────────────────────────╮
-│▄▄▄▄▄▄▄▄▄▄▄▄▄▄  Dune 1                                               │
-│██████████████  Frank Herbert                                        │
-│██▀▀▀▀▀▀▀▀▀▀██  Presses Pocket  ·  French  ·  97 pages  ·  781 KB    │
-│██▄▄▄▄▄▄▄▄▄▄██  md5 e7c75dc2964ce80c19cb69140aae8614                 │
-│▀▀▀▀▀▀▀▀▀▀▀▀▀▀  ~/Downloads                                          │
-╰─────────────────────────────────────────────────────────────────────╯
+╭  1 SEARCH    2 LIBRARY 12  ─────────────────────────────── ● libgen.li ╮
+│❯ author:herbert title:dune                                           │
+╰──────────────────────────────────────────────────────────────────────╯
+    TITLE                        AUTHOR         YEAR LANG    SIZE   FMT
+▌   Dune 1                       Frank Herbert       French  781 KB epub
+    Sisterhood of Dune           Brian Herbert  2012 English 1000 KB epub
+    Heretics of Dune             Frank Herbert  1984 English  937 KB azw3
+╭──────────────────────────────────────────────────────────────────────╮
+│▄▄▄▄▄▄▄▄▄▄▄▄▄▄  Dune 1                                                │
+│██████████████  Frank Herbert                                         │
+│██▀▀▀▀▀▀▀▀▀▀██  Presses Pocket  ·  French  ·  97 pages  ·  781 KB     │
+│██▄▄▄▄▄▄▄▄▄▄██  md5 e7c75dc2964ce80c19cb69140aae8614                  │
+│▀▀▀▀▀▀▀▀▀▀▀▀▀▀  ⏎ download → ~/Downloads                              │
+╰──────────────────────────────────────────────────────────────────────╯
  tab library  ↑↓ move  space mark  ⏎ download  o open  / search  ? help
 ```
+
+The active tab is a solid accent chip, the highlighted row carries a `▌` bar
+that reads even when the list holds a single item, and colour is used sparingly:
+one teal accent for what's interactive, a warm amber for a file's format and your
+book count, three levels of grey for everything else.
 
 The **Library** tab lists every book you have downloaded, newest first, and
 persists between sessions — it is a view onto `~/.local/share/clibgen/history.tsv`.
