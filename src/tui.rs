@@ -229,11 +229,6 @@ impl Sort {
         Sort::Size,
     ];
 
-    fn next(self) -> Self {
-        let at = Self::CYCLE.iter().position(|s| *s == self).unwrap_or(0);
-        Self::CYCLE[(at + 1) % Self::CYCLE.len()]
-    }
-
     /// What the control strip calls this order. `Relevance` reads differently
     /// depending on the tab, since a library has no relevance to speak of.
     fn label(self, tab: Tab) -> &'static str {
@@ -378,6 +373,20 @@ impl Picker {
     }
 }
 
+/// The little menu behind `s`: which column orders the list, and which way.
+///
+/// Sort is the other thing that used to step one keypress at a time — `s`
+/// walked relevance → title → author → year → size and back. Like the facet
+/// picker, this floats the whole set of orders over the results so the one you
+/// want is a single choice, with its direction shown and flippable in place.
+struct SortPick {
+    /// Index into `Sort::CYCLE` of the highlighted key.
+    cursor: usize,
+    /// The direction Enter would apply for the highlighted key. It follows the
+    /// key's natural default as the highlight moves; `←`/`→` overrides it.
+    desc: bool,
+}
+
 /// The image id used for the cover. Reusing one id means each new cover
 /// replaces the last rather than piling up in the terminal's store.
 const COVER_ID: u32 = 0x636C_6267;
@@ -414,6 +423,9 @@ pub struct App {
     /// by format, language or author — the interactive answer to "epubs only"
     /// or "just the Le Guin ones" without re-running the search.
     picker: Option<Picker>,
+    /// The open sort menu, when one is up. Like the facet picker, a modal that
+    /// takes every key while it is showing.
+    sort_menu: Option<SortPick>,
     /// How the visible list is ordered, and which way. Shared by both tabs and,
     /// like the filters, a standing preference that survives the next search.
     sort: Sort,
@@ -513,6 +525,7 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
         lang_filter: None,
         author_filter: None,
         picker: None,
+        sort_menu: None,
         sort: Sort::Relevance,
         sort_desc: false,
         table: TableState::default(),
@@ -866,11 +879,25 @@ impl App {
         self.visible = visible;
     }
 
-    /// Step the sort to the next key, in the direction that key is most useful
-    /// the first time it is picked. Works from either tab.
-    fn cycle_sort(&mut self) {
-        self.sort = self.sort.next();
-        self.sort_desc = self.sort.natural_desc();
+    /// Raise the sort menu, opened on the order in force so a glance says how
+    /// the list is arranged and Enter on it changes nothing. Works from either
+    /// tab, since both share the one sort.
+    fn open_sort_menu(&mut self) {
+        let cursor = Sort::CYCLE.iter().position(|s| *s == self.sort).unwrap_or(0);
+        self.sort_menu = Some(SortPick {
+            cursor,
+            desc: self.sort_desc,
+        });
+    }
+
+    /// Commit the highlighted order and close the menu. `Relevance` is the
+    /// list's own order and carries no direction, so it always applies ascending.
+    fn apply_sort_menu(&mut self) {
+        let Some(menu) = self.sort_menu.take() else {
+            return;
+        };
+        self.sort = Sort::CYCLE[menu.cursor];
+        self.sort_desc = self.sort != Sort::Relevance && menu.desc;
         self.resort();
     }
 
@@ -1583,6 +1610,11 @@ impl App {
             self.on_key_picker(key);
             return;
         }
+        // The sort menu is modal in the same way.
+        if self.sort_menu.is_some() {
+            self.on_key_sort(key);
+            return;
+        }
         // Switching tabs works from everywhere, including mid-typing. The
         // library used to be reachable only from the results list, which meant
         // you had to run a search before you could look at books you already
@@ -1712,7 +1744,7 @@ impl App {
             KeyCode::Char('l') => self.open_picker(Facet::Language),
             KeyCode::Char('a') => self.open_picker(Facet::Author),
             KeyCode::Char('x') if self.any_filter() => self.clear_filters(),
-            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('s') => self.open_sort_menu(),
             KeyCode::Char('S') => self.reverse_sort(),
             KeyCode::Char('y') => self.yank_md5(),
             KeyCode::Enter => self.spawn_downloads(),
@@ -1782,6 +1814,46 @@ impl App {
         }
     }
 
+    /// Keys while the sort menu is up. The list is short and takes no text, so
+    /// the arrows and `j`/`k` both walk it; `←`/`→` (and `h`/`l`) flip the
+    /// highlighted key's direction; Enter commits and Esc — or `s` again —
+    /// backs out.
+    fn on_key_sort(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('q') => {
+                self.sort_menu = None;
+                return;
+            }
+            KeyCode::Enter => {
+                self.apply_sort_menu();
+                return;
+            }
+            _ => {}
+        }
+        let Some(menu) = self.sort_menu.as_mut() else {
+            return;
+        };
+        let last = Sort::CYCLE.len() - 1;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                menu.cursor = menu.cursor.saturating_sub(1);
+                menu.desc = Sort::CYCLE[menu.cursor].natural_desc();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.cursor = (menu.cursor + 1).min(last);
+                menu.desc = Sort::CYCLE[menu.cursor].natural_desc();
+            }
+            // Relevance is the mirror's own order; there is no ascending or
+            // descending to choose, so the direction keys leave it alone.
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                if Sort::CYCLE[menu.cursor] != Sort::Relevance =>
+            {
+                menu.desc = !menu.desc;
+            }
+            _ => {}
+        }
+    }
+
     fn on_key_library(&mut self, key: KeyEvent) {
         match key.code {
             // The library is a peer of the search tab, not a detour off it, so
@@ -1804,7 +1876,7 @@ impl App {
                 self.library_table.select(Some(self.shown.len() - 1));
                 self.selection_moved();
             }
-            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('s') => self.open_sort_menu(),
             KeyCode::Char('S') => self.reverse_sort(),
             KeyCode::Char('y') => self.yank_md5(),
             KeyCode::Enter | KeyCode::Char('o') => self.launch_selected(false),
@@ -1985,6 +2057,9 @@ impl App {
         }
         if self.picker.is_some() {
             self.render_picker(frame);
+        }
+        if self.sort_menu.is_some() {
+            self.render_sort_menu(frame);
         }
     }
 
@@ -2228,6 +2303,92 @@ impl App {
         .flatten()
         .collect();
         frame.render_widget(Paragraph::new(Line::from(footer)), rows[3]);
+    }
+
+    /// The sort menu: the orders the list can take, the active one marked, and
+    /// a direction caret on the highlighted row that `←`/`→` flips. Small and
+    /// fixed — five keys, no typing — so it needs neither a search line nor
+    /// scrolling, just the list and its legend.
+    fn render_sort_menu(&self, frame: &mut Frame) {
+        let Some(menu) = &self.sort_menu else {
+            return;
+        };
+        let screen = frame.area();
+        // Border(2) + the five orders + the legend row.
+        let height = (Sort::CYCLE.len() as u16 + 3).min(screen.height.saturating_sub(2));
+        let width = 42u16.min(screen.width.saturating_sub(4));
+        let area = centered(screen, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(theme::ACCENT))
+            .style(Style::new().bg(theme::BG_ALT))
+            .title(Span::styled(
+                " sort by ",
+                Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+
+        let amber = Style::new().fg(theme::AMBER);
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, &order) in Sort::CYCLE.iter().enumerate() {
+            let selected = i == menu.cursor;
+            let active = order == self.sort;
+            let gutter = if selected {
+                Span::styled(theme::CURSOR, theme::accent())
+            } else {
+                Span::raw("  ")
+            };
+            // A dot on the order the list is arranged by right now.
+            let mark = Span::styled(if active { "● " } else { "  " }, theme::accent());
+            let label = Span::styled(
+                order.label(self.tab).to_string(),
+                if selected || active {
+                    theme::text().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::muted()
+                },
+            );
+            // The caret rides the highlighted row (the direction Enter would
+            // apply) and the active row (how it is sorted now); Relevance, the
+            // mirror's own order, shows none.
+            let caret = if order == Sort::Relevance {
+                ""
+            } else if selected {
+                if menu.desc { " ▼" } else { " ▲" }
+            } else if active {
+                if self.sort_desc { " ▼" } else { " ▲" }
+            } else {
+                ""
+            };
+            let mut line = Line::from(vec![gutter, mark, label, Span::styled(caret, amber)]);
+            if selected {
+                line = line.style(theme::selected_row());
+            }
+            lines.push(line);
+        }
+        frame.render_widget(Paragraph::new(lines), rows[0]);
+
+        let legend = |k: &str, l: &str| {
+            [
+                Span::styled(format!("{k} "), theme::accent().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{l}  "), theme::faint()),
+            ]
+        };
+        let footer: Vec<Span> = [
+            legend("⏎", "sort"),
+            legend("↑↓", "move"),
+            legend("←→", "dir"),
+            legend("esc", "close"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        frame.render_widget(Paragraph::new(Line::from(footer)), rows[1]);
     }
 
     /// The Library tab's control strip: the sort on the right, and on the left
@@ -3364,7 +3525,7 @@ impl App {
                     ("↑ ↓  k j", "move the selection"),
                     ("PgUp PgDn", "move ten at a time"),
                     ("g  G", "jump to first / last"),
-                    ("s  S", "cycle the sort / reverse it"),
+                    ("s", "open the sort menu; S reverses in place"),
                     ("y", "copy the MD5 to the clipboard"),
                     ("?", "this help"),
                     ("q  esc", "quit"),
@@ -3703,6 +3864,7 @@ mod tests {
             lang_filter: None,
             author_filter: None,
             picker: None,
+            sort_menu: None,
             sort: Sort::Relevance,
             sort_desc: false,
             table: TableState::default(),
@@ -3743,6 +3905,22 @@ mod tests {
         press(app, KeyCode::Char(facet_key));
         for c in query.chars() {
             press(app, KeyCode::Char(c));
+        }
+        press(app, KeyCode::Enter);
+    }
+
+    /// Drive the sort menu: open it, walk the highlight to the wanted order, and
+    /// commit — taking that order's natural direction, the same default the old
+    /// `s` cycle used.
+    fn sort_to(app: &mut App, want: Sort) {
+        press(app, KeyCode::Char('s'));
+        let target = Sort::CYCLE.iter().position(|s| *s == want).unwrap();
+        loop {
+            let at = app.sort_menu.as_ref().unwrap().cursor;
+            if at == target {
+                break;
+            }
+            press(app, if at < target { KeyCode::Down } else { KeyCode::Up });
         }
         press(app, KeyCode::Enter);
     }
@@ -3917,7 +4095,7 @@ mod tests {
         // Rest the cursor on a book, then sort by title: it must follow.
         a.table.select(Some(1));
         assert_eq!(a.selected().unwrap().title, "alpha");
-        a.cycle_sort(); // Relevance -> Title, ascending, case-insensitive
+        sort_to(&mut a, Sort::Title); // ascending, case-insensitive
         assert_eq!(a.sort, Sort::Title);
         assert_eq!(titles(&a), ["alpha", "Bravo", "Charlie"]);
         assert_eq!(
@@ -3926,17 +4104,16 @@ mod tests {
             "the highlight tracks its book across a re-sort"
         );
 
-        a.cycle_sort(); // -> Author (all equal here, so order is unchanged)
-        a.cycle_sort(); // -> Year, newest first by default
+        sort_to(&mut a, Sort::Year); // newest first by default
         assert_eq!(a.sort, Sort::Year);
         assert_eq!(titles(&a), ["Bravo", "Charlie", "alpha"]);
 
-        a.cycle_sort(); // -> Size, biggest first by default
+        sort_to(&mut a, Sort::Size); // biggest first by default
         assert_eq!(titles(&a), ["Charlie", "Bravo", "alpha"]);
         a.reverse_sort(); // smallest first
         assert_eq!(titles(&a), ["alpha", "Bravo", "Charlie"]);
 
-        a.cycle_sort(); // -> back to Relevance, closing the loop
+        sort_to(&mut a, Sort::Relevance); // the mirror's own order again
         assert_eq!(a.sort, Sort::Relevance);
         assert_eq!(titles(&a), ["Charlie", "alpha", "Bravo"]);
     }
@@ -4168,6 +4345,59 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_sort_menu_opens_on_the_current_order() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        a.sort = Sort::Year;
+        press(&mut a, KeyCode::Char('s'));
+        let menu = a.sort_menu.as_ref().expect("menu is up");
+        assert_eq!(Sort::CYCLE[menu.cursor], Sort::Year, "highlight starts on the order in force");
+        let screen = draw(&mut a, 90, 24);
+        assert!(screen.contains("sort by"), "{screen}");
+        assert!(screen.contains("relevance") && screen.contains("size"), "{screen}");
+    }
+
+    #[test]
+    fn the_sort_menu_selects_a_column_directly() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        // From relevance, open and jump straight to Size — one choice, not four
+        // steps through the orders in between.
+        sort_to(&mut a, Sort::Size);
+        assert_eq!(a.sort, Sort::Size);
+        assert!(a.sort_desc, "size opens biggest-first by default");
+        assert!(a.sort_menu.is_none(), "committing closes the menu");
+    }
+
+    #[test]
+    fn the_sort_menu_flips_direction_in_place() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        a.sort = Sort::Title;
+        press(&mut a, KeyCode::Char('s')); // opens on Title, ascending
+        press(&mut a, KeyCode::Left); // flip to descending
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.sort, Sort::Title);
+        assert!(a.sort_desc, "the direction key set it descending");
+    }
+
+    #[test]
+    fn esc_leaves_the_sort_untouched() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.sort_menu.is_none());
+        assert_eq!(a.sort, Sort::Relevance, "backing out changes nothing");
     }
 
     #[test]

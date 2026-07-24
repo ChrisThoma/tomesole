@@ -45,11 +45,13 @@ box always says how much of the catch is on screen (`4 of 40 shown`). The
 filters are standing preferences — they survive the next search — and `x`
 clears them all.
 
-A ragged pile also wants an order. `s` cycles the sort — relevance (the
-mirror's own guess), then title, author, year and size — and `S` reverses it,
-so "the smallest EPUB" or "the newest edition" is a keypress rather than a
-squint down the `SIZE` column. Size and year start biggest- and newest-first,
-because that is nearly always what you meant. An edition you have downloaded
+A ragged pile also wants an order. `s` opens a little menu of the orders —
+relevance (the mirror's own guess), title, author, year, size — with the one in
+force marked and its direction shown; pick a column and `←`/`→` flip the way it
+runs, or `S` reverses in place without opening anything. So "the smallest EPUB"
+or "the newest edition" is a choice rather than a squint down the `SIZE` column.
+Size and year start biggest- and newest-first, because that is nearly always
+what you meant. An edition you have downloaded
 before is marked `library` in its own column and with a green dot, so you
 never fetch the same book twice by accident; and when several results are
 marked for a batch, the strip totals what they will pull (`3 marked · 24 MB`)
@@ -82,7 +84,7 @@ earlier search.
 | `⏎` | search / download the selection, or open a library book |
 | `↑` `↓` `k` `j` | move; `PgUp`/`PgDn` for ten, `g`/`G` for ends |
 | `e` `l` `a` | open the format / language / author menu (type to narrow, `⏎` to choose, `⇥` to switch facet); `x` clears every filter |
-| `s` `S` | cycle the sort (relevance, title, author, year, size); `S` reverses it |
+| `s` | open the sort menu (relevance, title, author, year, size; `←`/`→` set direction); `S` reverses in place |
 | `space` | mark a result; `A` marks or unmarks everything showing |
 | `y` | copy the highlighted book's MD5 to the clipboard |
 | `o` `f` | open a downloaded book, or show it in the file manager |
