@@ -401,6 +401,19 @@ const COVER_ID: u32 = 0x636C_6267;
 /// Long enough that holding a cursor key down does not fire a request per row.
 const COVER_DELAY: Duration = Duration::from_millis(250);
 
+/// The wordmark over the empty search landing — a figlet "ANSI Shadow" banner of
+/// the app name. Six rows, every line padded to exactly `WORDMARK_W` columns so
+/// the block stays rigid under centred alignment rather than drifting a row.
+const WORDMARK: &str = "\
+████████╗ ██████╗ ███╗   ███╗███████╗███████╗ ██████╗ ██╗     ███████╗
+╚══██╔══╝██╔═══██╗████╗ ████║██╔════╝██╔════╝██╔═══██╗██║     ██╔════╝
+   ██║   ██║   ██║██╔████╔██║█████╗  ███████╗██║   ██║██║     █████╗
+   ██║   ██║   ██║██║╚██╔╝██║██╔══╝  ╚════██║██║   ██║██║     ██╔══╝
+   ██║   ╚██████╔╝██║ ╚═╝ ██║███████╗███████║╚██████╔╝███████╗███████╗
+   ╚═╝    ╚═════╝ ╚═╝     ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚══════╝╚══════╝";
+const WORDMARK_W: u16 = 70;
+const WORDMARK_H: u16 = 6;
+
 pub struct App {
     settings: Settings,
     tab: Tab,
@@ -2111,23 +2124,54 @@ impl App {
     /// terminal's cursor wants to be — not craned up to the top edge — and it
     /// keeps the box next to the keys that explain it.
     fn render_landing(&self, frame: &mut Frame, area: Rect) {
+        // The wordmark is the Search tab's face; the empty Library keeps its own
+        // "your library is empty" note with no banner. It shows only when the
+        // screen can hold it whole — a short or narrow terminal falls back to
+        // just the box, so the art never has to clip or wrap.
+        let show_mark =
+            self.tab == Tab::Search && area.height >= 16 && area.width >= WORDMARK_W + 2;
+        let mark_rows = if show_mark { WORDMARK_H + 1 } else { 0 }; // +1 breathing row
+
         let rows = Layout::vertical([
             Constraint::Fill(4),
-            Constraint::Length(3), // search box
-            Constraint::Length(1), // breathing room
-            Constraint::Length(4), // guidance / status / error
+            Constraint::Length(mark_rows), // wordmark + gap (0 when hidden)
+            Constraint::Length(3),         // search box
+            Constraint::Length(1),         // breathing room
+            Constraint::Length(4),         // guidance / status / error
             Constraint::Fill(5),
-            Constraint::Length(1), // key hints
+            Constraint::Length(1),         // key hints
         ])
         .split(area);
 
+        if show_mark {
+            self.render_wordmark(frame, rows[1]);
+        }
         // A capped width so it reads as a search field rather than a full-bleed
         // bar; centred so it sits under the eye, not off in a corner.
         let box_w = area.width.saturating_sub(6).clamp(24, 76);
-        self.render_input(frame, centered(rows[1], box_w, rows[1].height));
+        self.render_input(frame, centered(rows[2], box_w, rows[2].height));
         let guide_w = area.width.saturating_sub(4).min(80);
-        self.render_landing_guide(frame, centered(rows[3], guide_w, rows[3].height));
-        self.render_hints(frame, rows[5]);
+        self.render_landing_guide(frame, centered(rows[4], guide_w, rows[4].height));
+        self.render_hints(frame, rows[6]);
+    }
+
+    /// Paint the big ASCII wordmark, centred, in the theme accent. Each line is
+    /// padded to the banner's full width before it goes down, so centred
+    /// alignment holds the block square rather than nudging the two short rows.
+    /// No `Wrap` is set, so a line can only ever clip — never fold — but the
+    /// caller gates on width so even that does not happen.
+    fn render_wordmark(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = WORDMARK
+            .lines()
+            .map(|l| {
+                Line::from(Span::styled(
+                    format!("{l:<width$}", width = WORDMARK_W as usize),
+                    theme::accent(),
+                ))
+            })
+            .collect();
+        let spot = centered(area, WORDMARK_W, WORDMARK_H);
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), spot);
     }
 
     /// What sits under the box before there is a list: an error if a search just
