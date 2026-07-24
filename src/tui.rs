@@ -1989,69 +1989,79 @@ impl App {
         );
         self.cover_area = None;
 
-        let side = self.side_panel(area);
-        // A secondary control strip sits under the box on both tabs once each
-        // has something to describe: the facets, sort and counts on Search; the
-        // sort and a one-line summary of the shelf on Library. Giving both tabs
-        // the same row is what makes them read as two views of one interface
-        // rather than two unrelated screens.
-        let filter_bar = match self.tab {
-            Tab::Search => !self.results.is_empty(),
-            Tab::Library => !self.library.is_empty(),
-        } as u16;
-        // No strip when there is nothing to describe — a bordered box holding
-        // "no selection" is furniture, not information. Errors still earn it.
-        let empty_tab = match self.tab {
+        // A terminal is a bottom-up place, so the interface is too. With nothing
+        // to browse yet the search box floats near the middle — where the eye
+        // already rests and a keystroke from the hints below. The moment a
+        // search lands something to look at, the box settles to the bottom and
+        // the results take the screen.
+        let landing = match self.tab {
             Tab::Search => self.results.is_empty(),
-            Tab::Library => self.shown.is_empty(),
+            Tab::Library => self.library.is_empty(),
         };
-        let details = if side || (empty_tab && self.error.is_none()) {
-            0
+        if landing {
+            self.render_landing(frame, area);
         } else {
-            self.details_height(area)
-        };
-        let chunks = Layout::vertical([
-            Constraint::Length(3),          // search box
-            Constraint::Length(filter_bar), // the two facets, when there are results
-            Constraint::Min(3),             // results
-            Constraint::Length(details),    // details strip (narrow layout)
-            Constraint::Length(1),          // key hints
-        ])
-        .split(area);
+            let side = self.side_panel(area);
+            // A control strip rides directly on top of the box: the facets, sort
+            // and counts on Search; the sort and a one-line shelf summary on
+            // Library. Gathering everything you type with at the bottom is what
+            // keeps the two tabs reading as one interface.
+            let filter_bar = match self.tab {
+                Tab::Search => !self.results.is_empty(),
+                Tab::Library => !self.library.is_empty(),
+            } as u16;
+            let empty_tab = match self.tab {
+                Tab::Search => self.visible.is_empty(),
+                Tab::Library => self.shown.is_empty(),
+            };
+            let details = if side || (empty_tab && self.error.is_none()) {
+                0
+            } else {
+                self.details_height(area)
+            };
+            let chunks = Layout::vertical([
+                Constraint::Min(3),             // results / library body
+                Constraint::Length(details),    // details strip (narrow layout)
+                Constraint::Length(filter_bar), // facets / shelf summary + sort
+                Constraint::Length(3),          // search box
+                Constraint::Length(1),          // key hints
+            ])
+            .split(area);
 
-        self.render_input(frame, chunks[0]);
-        if filter_bar == 1 {
             match self.tab {
-                Tab::Search => self.render_filters(frame, chunks[1]),
-                Tab::Library => self.render_library_strip(frame, chunks[1]),
-            }
-        }
-        match self.tab {
-            _ if side => {
-                let columns =
-                    Layout::horizontal([Constraint::Min(40), Constraint::Length(42)])
-                        .split(chunks[2]);
-                match self.tab {
-                    Tab::Search => {
-                        self.render_results(frame, columns[0]);
-                        self.render_side_details(frame, columns[1]);
-                    }
-                    Tab::Library => {
-                        self.render_library(frame, columns[0]);
-                        self.render_library_side_details(frame, columns[1]);
+                _ if side => {
+                    let columns =
+                        Layout::horizontal([Constraint::Min(40), Constraint::Length(42)])
+                            .split(chunks[0]);
+                    match self.tab {
+                        Tab::Search => {
+                            self.render_results(frame, columns[0]);
+                            self.render_side_details(frame, columns[1]);
+                        }
+                        Tab::Library => {
+                            self.render_library(frame, columns[0]);
+                            self.render_library_side_details(frame, columns[1]);
+                        }
                     }
                 }
+                Tab::Search => {
+                    self.render_results(frame, chunks[0]);
+                    self.render_details(frame, chunks[1]);
+                }
+                Tab::Library => {
+                    self.render_library(frame, chunks[0]);
+                    self.render_library_details(frame, chunks[1]);
+                }
             }
-            Tab::Search => {
-                self.render_results(frame, chunks[2]);
-                self.render_details(frame, chunks[3]);
+            if filter_bar == 1 {
+                match self.tab {
+                    Tab::Search => self.render_filters(frame, chunks[2]),
+                    Tab::Library => self.render_library_strip(frame, chunks[2]),
+                }
             }
-            Tab::Library => {
-                self.render_library(frame, chunks[2]);
-                self.render_library_details(frame, chunks[3]);
-            }
+            self.render_input(frame, chunks[3]);
+            self.render_hints(frame, chunks[4]);
         }
-        self.render_hints(frame, chunks[4]);
 
         if self.mode == Mode::Help {
             self.render_help(frame);
@@ -2062,6 +2072,80 @@ impl App {
         if self.sort_menu.is_some() {
             self.render_sort_menu(frame);
         }
+    }
+
+    /// The opening state: the search box near the middle with a line of guidance
+    /// under it, and the hints pinned to the foot of the screen. This is where a
+    /// terminal's cursor wants to be — not craned up to the top edge — and it
+    /// keeps the box next to the keys that explain it.
+    fn render_landing(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::vertical([
+            Constraint::Fill(4),
+            Constraint::Length(3), // search box
+            Constraint::Length(1), // breathing room
+            Constraint::Length(4), // guidance / status / error
+            Constraint::Fill(5),
+            Constraint::Length(1), // key hints
+        ])
+        .split(area);
+
+        // A capped width so it reads as a search field rather than a full-bleed
+        // bar; centred so it sits under the eye, not off in a corner.
+        let box_w = area.width.saturating_sub(6).clamp(24, 76);
+        self.render_input(frame, centered(rows[1], box_w, rows[1].height));
+        let guide_w = area.width.saturating_sub(4).min(80);
+        self.render_landing_guide(frame, centered(rows[3], guide_w, rows[3].height));
+        self.render_hints(frame, rows[5]);
+    }
+
+    /// What sits under the box before there is a list: an error if a search just
+    /// failed, the live status while one runs, or a quiet word on how to begin.
+    fn render_landing_guide(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = if let Some(err) = &self.error {
+            vec![Line::from(vec![
+                Span::styled("⚠ ", Style::new().fg(theme::DANGER)),
+                Span::styled(err.clone(), Style::new().fg(theme::DANGER)),
+            ])]
+        } else if self.busy {
+            vec![Line::from(vec![
+                Span::styled(format!("{} ", spinner_frame(self.spinner)), theme::accent()),
+                Span::styled(self.status.clone(), theme::muted()),
+            ])]
+        } else if !self.status.is_empty() {
+            vec![Line::from(Span::styled(self.status.clone(), theme::muted()))]
+        } else {
+            match self.tab {
+                Tab::Search => vec![
+                    Line::from(Span::styled(
+                        "Search millions of books on Library Genesis.",
+                        theme::muted(),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("try ", theme::faint()),
+                        Span::styled("author:", theme::accent()),
+                        Span::styled("  ", theme::faint()),
+                        Span::styled("title:", theme::accent()),
+                        Span::styled("  ", theme::faint()),
+                        Span::styled("ext:", theme::accent()),
+                        Span::styled(" to narrow a search", theme::faint()),
+                    ]),
+                ],
+                Tab::Library => vec![
+                    Line::from(Span::styled(
+                        "Your library is empty.",
+                        theme::text().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Books you download land here. Press ", theme::faint()),
+                        Span::styled("Tab", theme::accent()),
+                        Span::styled(" to go find one.", theme::faint()),
+                    ]),
+                ],
+            }
+        };
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
     }
 
     /// The refinement bar: the three facets and what they leave showing.
@@ -2599,18 +2683,27 @@ impl App {
             self.table.selected().unwrap_or(0),
         );
 
-        let header = Row::new([
-            Cell::from(""),
-            Cell::from("TITLE"),
-            Cell::from("AUTHOR"),
-            Cell::from("YEAR"),
-            Cell::from("LANGUAGE"),
-            Cell::from("SIZE"),
-            Cell::from("FMT"),
-            Cell::from("STATUS"),
-        ])
-        .style(theme::header())
-        .height(1);
+        // Titles carry the screen, so they are the last thing to lose room and
+        // never the first: the trimmable columns fall away as the list narrows,
+        // widest and least essential going soonest.
+        let w = area.width;
+        let show_year = w >= 56;
+        let show_lang = w >= 84;
+        let show_status = w >= 98;
+
+        let mut head = vec![Cell::from(""), Cell::from("TITLE"), Cell::from("AUTHOR")];
+        if show_year {
+            head.push(Cell::from("YEAR"));
+        }
+        if show_lang {
+            head.push(Cell::from("LANGUAGE"));
+        }
+        head.push(Cell::from("SIZE"));
+        head.push(Cell::from("FMT"));
+        if show_status {
+            head.push(Cell::from("STATUS"));
+        }
+        let header = Row::new(head).style(theme::header()).height(1);
 
         let selected = self.table.selected();
         let rows: Vec<Row> = self
@@ -2666,20 +2759,30 @@ impl App {
                     theme::format_chip(book.ext())
                 };
 
-                Row::new([
+                let mut cells = vec![
                     Cell::from(marker).style(marker_style),
                     Cell::from(book.title.clone()).style(title_style),
                     Cell::from(author).style(theme::muted()),
-                    Cell::from(book.year.clone().unwrap_or_default()).style(theme::faint()),
-                    Cell::from(book.language.clone().unwrap_or_default())
-                        .style(Style::new().fg(theme::LANG)),
-                    Cell::from(book.size_human()).style(theme::muted()),
-                    Cell::from(format!(" {} ", book.ext())).style(chip),
-                    Cell::from(status_text).style(status_style),
-                ])
+                ];
+                if show_year {
+                    cells.push(
+                        Cell::from(book.year.clone().unwrap_or_default()).style(theme::faint()),
+                    );
+                }
+                if show_lang {
+                    cells.push(
+                        Cell::from(book.language.clone().unwrap_or_default())
+                            .style(Style::new().fg(theme::LANG)),
+                    );
+                }
+                cells.push(Cell::from(book.size_human()).style(theme::muted()));
+                cells.push(Cell::from(format!(" {} ", book.ext())).style(chip));
+                if show_status {
+                    cells.push(Cell::from(status_text).style(status_style));
+                }
                 // The zebra: alternate rows sit one step off the canvas, so a
                 // wide row can be followed without a ruler.
-                .style(Style::new().bg(if row % 2 == 1 {
+                Row::new(cells).style(Style::new().bg(if row % 2 == 1 {
                     theme::BG_ALT
                 } else {
                     theme::BG
@@ -2687,22 +2790,22 @@ impl App {
             })
             .collect();
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(1),
-                // Titles carry the information; authors repeat. Weight the
-                // room accordingly.
-                Constraint::Fill(5),
-                Constraint::Fill(2),
-                Constraint::Length(4),
-                Constraint::Length(10),
-                Constraint::Length(8),
-                Constraint::Length(6),
-                Constraint::Length(7),
-            ],
-        )
-        .header(header)
+        // Titles carry the information; authors repeat. Weight the room so the
+        // title always wins the slack the fixed columns leave behind.
+        let mut widths = vec![Constraint::Length(1), Constraint::Fill(6), Constraint::Fill(2)];
+        if show_year {
+            widths.push(Constraint::Length(4));
+        }
+        if show_lang {
+            widths.push(Constraint::Length(10));
+        }
+        widths.push(Constraint::Length(8)); // SIZE
+        widths.push(Constraint::Length(6)); // FMT
+        if show_status {
+            widths.push(Constraint::Length(7)); // STATUS
+        }
+        let table = Table::new(rows, widths)
+            .header(header)
         .column_spacing(1)
         .row_highlight_style(theme::selected_row())
         .highlight_symbol(Span::styled(
@@ -3134,16 +3237,21 @@ impl App {
         );
         let now = history::now();
 
-        let header = Row::new([
-            Cell::from(""),
-            Cell::from("TITLE"),
-            Cell::from("AUTHOR"),
-            Cell::from("ADDED"),
-            Cell::from("SIZE"),
-            Cell::from("FMT"),
-        ])
-        .style(theme::header())
-        .height(1);
+        // The shelf trims the same way the results do: title and author hold on,
+        // the date and size step aside when the column runs short.
+        let w = area.width;
+        let show_added = w >= 84;
+        let show_size = w >= 60;
+
+        let mut head = vec![Cell::from(""), Cell::from("TITLE"), Cell::from("AUTHOR")];
+        if show_added {
+            head.push(Cell::from("ADDED"));
+        }
+        if show_size {
+            head.push(Cell::from("SIZE"));
+        }
+        head.push(Cell::from("FMT"));
+        let header = Row::new(head).style(theme::header()).height(1);
 
         let selected = self.library_table.selected();
         let rows: Vec<Row> = self
@@ -3184,15 +3292,19 @@ impl App {
                     theme::format_chip(entry.ext())
                 };
 
-                Row::new([
+                let mut cells = vec![
                     Cell::from(marker).style(marker_style),
                     Cell::from(title).style(title_style),
                     Cell::from(entry.first_author()).style(theme::muted()),
-                    Cell::from(history::when(entry.at, now)).style(theme::muted()),
-                    Cell::from(human_bytes(entry.size)).style(theme::faint()),
-                    Cell::from(format!(" {} ", entry.ext())).style(chip),
-                ])
-                .style(Style::new().bg(if row % 2 == 1 {
+                ];
+                if show_added {
+                    cells.push(Cell::from(history::when(entry.at, now)).style(theme::muted()));
+                }
+                if show_size {
+                    cells.push(Cell::from(human_bytes(entry.size)).style(theme::faint()));
+                }
+                cells.push(Cell::from(format!(" {} ", entry.ext())).style(chip));
+                Row::new(cells).style(Style::new().bg(if row % 2 == 1 {
                     theme::BG_ALT
                 } else {
                     theme::BG
@@ -3200,24 +3312,22 @@ impl App {
             })
             .collect();
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(1),
-                Constraint::Fill(5),
-                Constraint::Fill(2),
-                Constraint::Length(12),
-                Constraint::Length(9),
-                Constraint::Length(6),
-            ],
-        )
-        .header(header)
-        .column_spacing(1)
-        .row_highlight_style(theme::selected_row())
-        .highlight_symbol(Span::styled(
-            theme::CURSOR,
-            theme::accent().add_modifier(Modifier::BOLD),
-        ));
+        let mut widths = vec![Constraint::Length(1), Constraint::Fill(6), Constraint::Fill(2)];
+        if show_added {
+            widths.push(Constraint::Length(12));
+        }
+        if show_size {
+            widths.push(Constraint::Length(9));
+        }
+        widths.push(Constraint::Length(6)); // FMT
+        let table = Table::new(rows, widths)
+            .header(header)
+            .column_spacing(1)
+            .row_highlight_style(theme::selected_row())
+            .highlight_symbol(Span::styled(
+                theme::CURSOR,
+                theme::accent().add_modifier(Modifier::BOLD),
+            ));
 
         frame.render_stateful_widget(table, area, &mut self.library_table);
     }
