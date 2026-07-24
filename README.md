@@ -16,13 +16,13 @@ and `Tab` (or `1`/`2`) moves between them from anywhere, including mid-search:
 ╭  1 SEARCH    2 LIBRARY 12  ──────────────────────────────── ● libgen.li ╮
 │❯ dune                                                                   │
 ╰─────────────────────────────────────────────────────────────────────────╯
- e format all    l language English 6    x clear             6 of 14 shown
-   TITLE                 AUTHOR         YEAR LANGUAGE  SIZE     FMT  ╭────╮
-▌  Dune                  Frank Herbert  1965 English   781 KB  epub │▄▄▄▄│
-   Dune Messiah          Frank Herbert  1969 English   922 KB  epub │████│
-   Children of Dune      Frank Herbert  1976 English   1.1 MB  pdf  │▀▀▀▀│
-                                                                    ╰────╯
- tab library  ↑↓ move  space mark  ⏎ download  e format  l language  ? help
+ e format all   l language English 6   x clear   s sort year ▼   6 of 14
+   TITLE                AUTHOR         YEAR LANG     SIZE   FMT  STATUS ╭──╮
+▌  Dune                 Frank Herbert  1965 English 781 KB epub library│▄▄│
+   Dune Messiah         Frank Herbert  1969 English 922 KB epub        │██│
+   Children of Dune     Frank Herbert  1976 English 1.1 MB pdf         │▀▀│
+                                                                       ╰──╯
+ tab library  ↑↓ move  ⏎ download  e format  l language  s sort  ? help
 ```
 
 The interface paints its own canvas — a deep blue-grey with zebra-striped
@@ -41,12 +41,24 @@ count, and the bar under the search box always says how much of the catch is
 on screen (`4 of 40 shown`). The filters are standing preferences — they
 survive the next search — and `x` clears them.
 
+A ragged pile also wants an order. `s` cycles the sort — relevance (the
+mirror's own guess), then title, author, year and size — and `S` reverses it,
+so "the smallest EPUB" or "the newest edition" is a keypress rather than a
+squint down the `SIZE` column. Size and year start biggest- and newest-first,
+because that is nearly always what you meant. An edition you have downloaded
+before is marked `library` in its own column and with a green dot, so you
+never fetch the same book twice by accident; and when several results are
+marked for a batch, the strip totals what they will pull (`3 marked · 24 MB`)
+before you commit. `y` lifts the highlighted book's MD5 onto the clipboard.
+
 The **Library** tab lists every book you have downloaded, newest first, and
 persists between sessions — it is a view onto `~/.local/share/clibgen/history.tsv`.
-`⏎` opens the highlighted book in your reader, `f` reveals it in the file
-manager, `/` filters the list by title, author or filename, and `d` forgets an
-entry without touching the file. A book whose file has since moved is shown greyed
-out and marked `missing`.
+A strip under the box sums up the shelf at a glance — `12 books · 1.2 GB · 8
+epub · 3 pdf · 1 mobi` — and the same `s` sort orders it by title, author, size
+or when it was added. `⏎` opens the highlighted book in your reader, `f`
+reveals it in the file manager, `/` filters the list by title, author or
+filename, and `d` forgets an entry without touching the file. A book whose file
+has since moved is shown greyed out and marked `missing`.
 
 Searching and downloading happen on worker threads, so the interface stays
 responsive while a large file comes down. Downloads run one at a time — firing
@@ -67,7 +79,9 @@ earlier search.
 | `↑` `↓` `k` `j` | move; `PgUp`/`PgDn` for ten, `g`/`G` for ends |
 | `e` `E` | cycle the format filter through what the results contain |
 | `l` `L` | cycle the language filter; `x` clears both filters |
+| `s` `S` | cycle the sort (relevance, title, author, year, size); `S` reverses it |
 | `space` | mark a result; `a` marks or unmarks everything showing |
+| `y` | copy the highlighted book's MD5 to the clipboard |
 | `o` `f` | open a downloaded book, or show it in the file manager |
 | `d` | forget a library entry (the file stays) |
 | `r` | re-run the search / re-read the library |
@@ -331,7 +345,7 @@ page.
 cargo test
 ```
 
-259 tests, no network needed. They cover the MD5 vectors, the SSRF and scheme
+268 tests, no network needed. They cover the MD5 vectors, the SSRF and scheme
 guards, filename sanitising against traversal and executable extensions, HTML
 scanning against real markup, and the streaming download path — including that
 a file failing its checksum is discarded and leaves nothing behind — against a

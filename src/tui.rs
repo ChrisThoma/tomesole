@@ -10,13 +10,16 @@
 //! requests at a volunteer-run mirror is a good way to get rate-limited, and it
 //! makes the progress display much easier to read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, TableState, Wrap,
+};
 use ureq::http::Uri;
 
 use crate::cover::Cover;
@@ -142,7 +145,14 @@ enum Ev {
 #[derive(Clone)]
 enum Job {
     Queued,
-    Running { done: u64, total: Option<u64> },
+    Running {
+        done: u64,
+        total: Option<u64>,
+        /// When the transfer began, so the detail pane can show a live speed
+        /// and estimate. Averaged over the whole transfer rather than sampled
+        /// instantaneously — steadier to read, and it needs no extra state.
+        started: Instant,
+    },
     Saved(String),
     Failed(String),
 }
@@ -192,6 +202,61 @@ enum Mode {
     Help,
 }
 
+/// How a list is ordered. A Libgen search comes back as a ragged pile — forty
+/// editions of one book, scattered years, sizes and formats — so being able to
+/// impose an order is as much a part of finding a book as the filters are.
+///
+/// `Relevance` is the order the mirror returned (its own guess at the best
+/// match) on the Search tab, and newest-first on the Library tab; the rest sort
+/// by one visible column. The two tabs share the machinery so the key means the
+/// same thing on both.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Sort {
+    Relevance,
+    Title,
+    Author,
+    Year,
+    Size,
+}
+
+impl Sort {
+    /// The cycle `s` walks through, ending back at the mirror's own order.
+    const CYCLE: [Sort; 5] = [
+        Sort::Relevance,
+        Sort::Title,
+        Sort::Author,
+        Sort::Year,
+        Sort::Size,
+    ];
+
+    fn next(self) -> Self {
+        let at = Self::CYCLE.iter().position(|s| *s == self).unwrap_or(0);
+        Self::CYCLE[(at + 1) % Self::CYCLE.len()]
+    }
+
+    /// What the control strip calls this order. `Relevance` reads differently
+    /// depending on the tab, since a library has no relevance to speak of.
+    fn label(self, tab: Tab) -> &'static str {
+        match self {
+            Sort::Relevance => match tab {
+                Tab::Search => "relevance",
+                Tab::Library => "recent",
+            },
+            Sort::Title => "title",
+            Sort::Author => "author",
+            Sort::Year => "year",
+            Sort::Size => "size",
+        }
+    }
+
+    /// The direction that key is most useful in the first time it is chosen:
+    /// names read A→Z, but "sort by size" almost always means "biggest first",
+    /// and "by year" means "newest first". `S` overrides this afterwards.
+    fn natural_desc(self) -> bool {
+        matches!(self, Sort::Year | Sort::Size)
+    }
+}
+
 /// The image id used for the cover. Reusing one id means each new cover
 /// replaces the last rather than piling up in the terminal's store.
 const COVER_ID: u32 = 0x636C_6267;
@@ -221,6 +286,10 @@ pub struct App {
     /// Narrow the results to one language, matched exactly against what the
     /// mirror reported.
     lang_filter: Option<String>,
+    /// How the visible list is ordered, and which way. Shared by both tabs and,
+    /// like the filters, a standing preference that survives the next search.
+    sort: Sort,
+    sort_desc: bool,
     table: TableState,
     marked: Vec<bool>,
     jobs: HashMap<String, Job>,
@@ -240,6 +309,10 @@ pub struct App {
     library: Vec<history::Entry>,
     /// Indices into `library` that survive the filter, in display order.
     shown: Vec<usize>,
+    /// The MD5s of every book already in the library, so a search result you
+    /// have downloaded before can be recognised at a glance and not fetched
+    /// twice. Rebuilt whenever the library is reloaded.
+    owned: HashSet<String>,
     library_table: TableState,
 
     /// How this terminal can draw a picture, if at all.
@@ -253,6 +326,10 @@ pub struct App {
     /// Where the last frame left room for the picture. Set during rendering,
     /// read afterwards by the code that writes the escape sequence.
     cover_area: Option<Rect>,
+    /// A frame counter, bumped once per draw, that drives the small animated
+    /// spinner shown while something is in flight. The event loop wakes on a
+    /// 250 ms timer even when idle, so it turns at a calm few frames a second.
+    spinner: usize,
 }
 
 /// Run the interface until the user quits.
@@ -306,6 +383,8 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
         visible: Vec::new(),
         fmt_filter: None,
         lang_filter: None,
+        sort: Sort::Relevance,
+        sort_desc: false,
         table: TableState::default(),
         marked: Vec::new(),
         jobs: HashMap::new(),
@@ -320,12 +399,14 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
         tx,
         library: Vec::new(),
         shown: Vec::new(),
+        owned: HashSet::new(),
         library_table: TableState::default(),
         protocol,
         covers: HashMap::new(),
         cover_due: None,
         painted: None,
         cover_area: None,
+        spinner: 0,
     };
     app.pending_search = !app.query.is_empty();
     // Read the library up front rather than when the tab is first opened: it
@@ -589,6 +670,7 @@ impl App {
         self.visible = (0..self.results.len())
             .filter(|&i| self.admits(&self.results[i]))
             .collect();
+        self.sort_visible();
         let position = keep.and_then(|md5| {
             self.visible
                 .iter()
@@ -599,6 +681,58 @@ impl App {
         } else {
             Some(position.unwrap_or(0))
         });
+        self.selection_moved();
+    }
+
+    /// Order the visible results by the active sort. The vector already carries
+    /// the mirror's own order, so `Relevance` only ever reverses it; the other
+    /// keys sort stably, so books with an equal key keep that underlying order.
+    fn sort_visible(&mut self) {
+        use std::cmp::Ordering;
+        if self.sort == Sort::Relevance {
+            if self.sort_desc {
+                self.visible.reverse();
+            }
+            return;
+        }
+        // Sort a detached copy so the closure can read the rest of `self`.
+        let mut visible = std::mem::take(&mut self.visible);
+        let (sort, desc) = (self.sort, self.sort_desc);
+        visible.sort_by(|&a, &b| {
+            let (x, y) = (&self.results[a], &self.results[b]);
+            let ord = match sort {
+                Sort::Title => x.title.to_lowercase().cmp(&y.title.to_lowercase()),
+                Sort::Author => first_author_of(x.authors.as_deref())
+                    .cmp(&first_author_of(y.authors.as_deref())),
+                Sort::Year => year_num(x.year.as_deref()).cmp(&year_num(y.year.as_deref())),
+                Sort::Size => x.size_bytes.unwrap_or(0).cmp(&y.size_bytes.unwrap_or(0)),
+                Sort::Relevance => Ordering::Equal,
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+        self.visible = visible;
+    }
+
+    /// Step the sort to the next key, in the direction that key is most useful
+    /// the first time it is picked. Works from either tab.
+    fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        self.sort_desc = self.sort.natural_desc();
+        self.resort();
+    }
+
+    /// Flip the current sort's direction, leaving the key alone.
+    fn reverse_sort(&mut self) {
+        self.sort_desc = !self.sort_desc;
+        self.resort();
+    }
+
+    /// Re-apply the sort to whichever list the visible tab owns.
+    fn resort(&mut self) {
+        match self.tab {
+            Tab::Search => self.refine(),
+            Tab::Library => self.refilter(),
+        }
         self.selection_moved();
     }
 
@@ -950,6 +1084,7 @@ impl App {
     /// highlight on something sensible.
     fn reload_library(&mut self) {
         self.library = history::load();
+        self.owned = self.library.iter().map(|e| e.md5.clone()).collect();
         self.refilter();
     }
 
@@ -959,6 +1094,7 @@ impl App {
     /// author or filename, case-insensitively — so the two agree about what
     /// "dune" means.
     fn refilter(&mut self) {
+        let keep = self.selected_entry().map(|e| e.md5.clone());
         let needle = self.filter.trim().to_lowercase();
         self.shown = self
             .library
@@ -974,19 +1110,52 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
+        self.sort_shown();
 
         self.library_table.select(if self.shown.is_empty() {
             None
         } else {
-            // Filtering shortens the list under the highlight, so pull it back
-            // in rather than leaving it pointing past the end.
-            Some(
+            // Keep the highlight on the same book when it is still shown; else
+            // pull it back in rather than leaving it pointing past the end.
+            let position = keep.and_then(|md5| {
+                self.shown.iter().position(|&i| self.library[i].md5 == md5)
+            });
+            Some(position.unwrap_or_else(|| {
                 self.library_table
                     .selected()
                     .unwrap_or(0)
-                    .min(self.shown.len() - 1),
-            )
+                    .min(self.shown.len() - 1)
+            }))
         });
+    }
+
+    /// Order the shown library entries by the active sort. `Relevance` is the
+    /// newest-first order the list already arrives in, so it only reverses.
+    fn sort_shown(&mut self) {
+        use std::cmp::Ordering;
+        if self.sort == Sort::Relevance {
+            if self.sort_desc {
+                self.shown.reverse();
+            }
+            return;
+        }
+        let mut shown = std::mem::take(&mut self.shown);
+        let (sort, desc) = (self.sort, self.sort_desc);
+        shown.sort_by(|&a, &b| {
+            let (x, y) = (&self.library[a], &self.library[b]);
+            let ord = match sort {
+                Sort::Title => x.title.to_lowercase().cmp(&y.title.to_lowercase()),
+                Sort::Author => first_author_of(x.authors.as_deref())
+                    .cmp(&first_author_of(y.authors.as_deref())),
+                // A library entry has no year column, so "year" falls back to
+                // when the book was added — the nearest thing it knows.
+                Sort::Year => x.at.cmp(&y.at),
+                Sort::Size => x.size.cmp(&y.size),
+                Sort::Relevance => Ordering::Equal,
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+        self.shown = shown;
     }
 
     fn selected_entry(&self) -> Option<&history::Entry> {
@@ -1043,6 +1212,24 @@ impl App {
             }
             Err(e) => self.error = Some(first_line(&e.to_string())),
         }
+    }
+
+    /// Copy the focused book's MD5 to the system clipboard.
+    ///
+    /// The MD5 is the one handle that identifies a book everywhere — it is what
+    /// `clibgen get` takes, and how a book is quoted to someone else — so it is
+    /// the thing worth lifting out of the interface without reaching for a
+    /// mouse. It goes out over OSC 52, the clipboard channel a terminal offers
+    /// with no platform dependency: honoured by kitty, iTerm2, WezTerm, Ghostty
+    /// and tmux, and harmlessly ignored elsewhere, so the status line reports
+    /// what was sent rather than claiming a guaranteed paste.
+    fn yank_md5(&mut self) {
+        let Some(md5) = self.focused_md5() else {
+            return;
+        };
+        copy_to_clipboard(&md5);
+        self.error = None;
+        self.status = format!("copied md5 {md5} to the clipboard");
     }
 
     /// Forget the highlighted entry. The file itself is left alone.
@@ -1145,7 +1332,13 @@ impl App {
                 self.error = Some(first_line(&e));
             }
             Ev::Progress { md5, done, total } => {
-                self.jobs.insert(md5, Job::Running { done, total });
+                // Keep the start time across updates so the speed and estimate
+                // are averaged over the whole transfer, not the last chunk.
+                let started = match self.jobs.get(&md5) {
+                    Some(Job::Running { started, .. }) => *started,
+                    _ => Instant::now(),
+                };
+                self.jobs.insert(md5, Job::Running { done, total, started });
             }
             Ev::Finished { md5, outcome } => {
                 let job = match outcome {
@@ -1346,6 +1539,9 @@ impl App {
                 self.lang_filter = None;
                 self.refine();
             }
+            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('S') => self.reverse_sort(),
+            KeyCode::Char('y') => self.yank_md5(),
             KeyCode::Enter => self.spawn_downloads(),
             KeyCode::Char('r') => self.spawn_search(),
             KeyCode::Char('m') => self.spawn_mirror_resolve(true),
@@ -1377,6 +1573,9 @@ impl App {
                 self.library_table.select(Some(self.shown.len() - 1));
                 self.selection_moved();
             }
+            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('S') => self.reverse_sort(),
+            KeyCode::Char('y') => self.yank_md5(),
             KeyCode::Enter | KeyCode::Char('o') => self.launch_selected(false),
             KeyCode::Char('f') => self.launch_selected(true),
             KeyCode::Char('d') => self.forget_selected(),
@@ -1475,6 +1674,9 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        // One tick per frame drives every animated glyph on screen. The loop
+        // wakes on a 250 ms timer even when idle, so it advances calmly.
+        self.spinner = self.spinner.wrapping_add(1);
         let area = frame.area();
         // The canvas goes down first; everything after patches colour onto it.
         frame.render_widget(
@@ -1484,7 +1686,15 @@ impl App {
         self.cover_area = None;
 
         let side = self.side_panel(area);
-        let filter_bar = (self.tab == Tab::Search && !self.results.is_empty()) as u16;
+        // A secondary control strip sits under the box on both tabs once each
+        // has something to describe: the facets, sort and counts on Search; the
+        // sort and a one-line summary of the shelf on Library. Giving both tabs
+        // the same row is what makes them read as two views of one interface
+        // rather than two unrelated screens.
+        let filter_bar = match self.tab {
+            Tab::Search => !self.results.is_empty(),
+            Tab::Library => !self.library.is_empty(),
+        } as u16;
         // No strip when there is nothing to describe — a bordered box holding
         // "no selection" is furniture, not information. Errors still earn it.
         let empty_tab = match self.tab {
@@ -1507,7 +1717,10 @@ impl App {
 
         self.render_input(frame, chunks[0]);
         if filter_bar == 1 {
-            self.render_filters(frame, chunks[1]);
+            match self.tab {
+                Tab::Search => self.render_filters(frame, chunks[1]),
+                Tab::Library => self.render_library_strip(frame, chunks[1]),
+            }
         }
         match self.tab {
             _ if side => {
@@ -1546,24 +1759,69 @@ impl App {
     /// It lives on its own row, under the search box, so the counts update in
     /// place as `e` and `l` cycle — filters you can watch working, rather than
     /// tags you have to re-type into a new search.
+    /// The sort indicator for the control strip: the key that cycles it, the
+    /// active order, and a caret for the direction — dropped for `Relevance`,
+    /// which is the list's own order and has no up or down.
+    fn sort_indicator(&self) -> Vec<Span<'static>> {
+        let caret = match (self.sort, self.sort_desc) {
+            (Sort::Relevance, _) => "",
+            (_, true) => " ▼",
+            (_, false) => " ▲",
+        };
+        vec![
+            Span::styled("s", theme::accent().add_modifier(Modifier::BOLD)),
+            Span::styled(" sort ", theme::faint()),
+            Span::styled(self.sort.label(self.tab).to_string(), theme::muted()),
+            Span::styled(caret.to_string(), Style::new().fg(theme::AMBER)),
+        ]
+    }
+
+    /// How many results are marked, and their combined size, when any are — so
+    /// the strip can say what a batch download is about to pull.
+    fn marked_summary(&self) -> Option<(usize, u64)> {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for (book, marked) in self.results.iter().zip(&self.marked) {
+            if *marked {
+                count += 1;
+                bytes += book.size_bytes.unwrap_or(0);
+            }
+        }
+        (count > 0).then_some((count, bytes))
+    }
+
     fn render_filters(&self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
             return;
         }
         let filtered = self.fmt_filter.is_some() || self.lang_filter.is_some();
 
-        // Right side first: how much of the catch is on screen. The amber only
-        // comes out when a filter is actually hiding something.
-        let counter = if self.visible.len() < self.results.len() {
-            Span::styled(
+        // Right side first: the sort, then either what a marked batch would
+        // pull, or how much of the catch is on screen. Amber comes out only
+        // when something is being narrowed or gathered.
+        let mut right = self.sort_indicator();
+        right.push(Span::styled("     ", theme::faint()));
+        match self.marked_summary() {
+            Some((n, bytes)) => {
+                let amber = Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD);
+                right.push(Span::styled(format!("{n} marked"), amber));
+                if bytes > 0 {
+                    right.push(Span::styled(format!("  {} ", human_bytes(bytes)), theme::muted()));
+                } else {
+                    right.push(Span::raw(" "));
+                }
+            }
+            None if self.visible.len() < self.results.len() => right.push(Span::styled(
                 format!("{} of {} shown ", self.visible.len(), self.results.len()),
                 Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!("{} results ", self.results.len()), theme::faint())
-        };
+            )),
+            None => right.push(Span::styled(
+                format!("{} results ", self.results.len()),
+                theme::faint(),
+            )),
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(counter)).alignment(Alignment::Right),
+            Paragraph::new(Line::from(right)).alignment(Alignment::Right),
             area,
         );
 
@@ -1603,6 +1861,70 @@ impl App {
             spans.push(label("clear"));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The Library tab's control strip: the sort on the right, and on the left
+    /// a one-line account of the shelf — how many books, how much disk, and the
+    /// handful of formats they are in — so the tab answers "what have I got"
+    /// before anyone scrolls. Each format word wears its own hue, the same one
+    /// the chips and the search results use.
+    fn render_library_strip(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+
+        // Right: the sort, and the filter count when a filter is hiding books.
+        let mut right = self.sort_indicator();
+        if !self.filter.trim().is_empty() {
+            right.push(Span::styled("     ", theme::faint()));
+            right.push(Span::styled(
+                format!("{} of {} shown ", self.shown.len(), self.library.len()),
+                Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            right.push(Span::raw(" "));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(right)).alignment(Alignment::Right),
+            area,
+        );
+
+        // Left: the count, the total on disk, then the format breakdown.
+        let count = self.library.len();
+        let total: u64 = self.library.iter().map(|e| e.size).sum();
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("{count} book{}", if count == 1 { "" } else { "s" }),
+                theme::muted(),
+            ),
+        ];
+        if total > 0 {
+            spans.push(Span::styled(format!("  ·  {}", human_bytes(total)), theme::faint()));
+        }
+        for (ext, n) in self.format_breakdown().into_iter().take(4) {
+            spans.push(Span::styled("    ", theme::faint()));
+            spans.push(Span::styled(format!("{n} "), theme::faint()));
+            spans.push(Span::styled(ext.clone(), Style::new().fg(theme::format_color(&ext))));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The library's formats, most common first, for the summary strip.
+    fn format_breakdown(&self) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for entry in &self.library {
+            let ext = entry.ext().to_ascii_lowercase();
+            if ext.is_empty() {
+                continue;
+            }
+            match counts.iter_mut().find(|(name, _)| *name == ext) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((ext, 1)),
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts
     }
 
     /// The tab bar and the text box under it.
@@ -1702,11 +2024,51 @@ impl App {
         }
     }
 
+    /// Reserve a slim scrollbar down the right edge of `area` when the list is
+    /// taller than the rows on show, and return the area left for the list. A
+    /// list that fits keeps the full width and gets no bar — the indicator only
+    /// appears when there is somewhere else to be. The thumb rides in
+    /// the accent over a faint track, and skips the header row so it lines up
+    /// with the rows it is measuring.
+    fn with_scrollbar(&self, frame: &mut Frame, area: Rect, len: usize, pos: usize) -> Rect {
+        let rows = area.height.saturating_sub(1) as usize;
+        if len <= rows || rows == 0 || area.width < 4 {
+            return area;
+        }
+        let track = Rect {
+            x: area.right() - 1,
+            y: area.y + 1,
+            width: 1,
+            height: area.height - 1,
+        };
+        let mut state = ScrollbarState::new(len)
+            .viewport_content_length(rows)
+            .position(pos);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .track_style(theme::faint())
+            .thumb_style(theme::accent());
+        frame.render_stateful_widget(bar, track, &mut state);
+        Rect {
+            width: area.width - 1,
+            ..area
+        }
+    }
+
     fn render_results(&mut self, frame: &mut Frame, area: Rect) {
         if self.visible.is_empty() {
             self.render_empty(frame, area);
             return;
         }
+        let area = self.with_scrollbar(
+            frame,
+            area,
+            self.visible.len(),
+            self.table.selected().unwrap_or(0),
+        );
 
         let header = Row::new([
             Cell::from(""),
@@ -1730,6 +2092,11 @@ impl App {
             .map(|(row, i, book)| {
                 let marked = self.marked.get(i).copied().unwrap_or(false);
                 let job = self.jobs.get(&book.md5);
+                // A book already on the shelf — from any past session, not just
+                // this one — is worth knowing before you download it again. It
+                // yields to a mark (you are clearly about to act on it) and to
+                // this session's own download state.
+                let owned = job.is_none() && !marked && self.owned.contains(&book.md5);
                 let (marker, marker_style) = match job {
                     Some(Job::Saved(_)) => ("✓", Style::new().fg(theme::SUCCESS)),
                     Some(Job::Failed(_)) => ("✗", Style::new().fg(theme::DANGER)),
@@ -1737,7 +2104,15 @@ impl App {
                         ("↓", Style::new().fg(theme::ACCENT))
                     }
                     None if marked => ("●", Style::new().fg(theme::AMBER)),
+                    None if owned => ("•", Style::new().fg(theme::SUCCESS)),
                     None => (" ", Style::new()),
+                };
+                // The status column carries this session's download state, and
+                // otherwise a quiet note that the book is already in the library.
+                let (status_text, status_style) = if owned {
+                    ("library".to_string(), Style::new().fg(theme::SUCCESS))
+                } else {
+                    (job_label(job), job_style(job))
                 };
 
                 let author = {
@@ -1771,7 +2146,7 @@ impl App {
                         .style(Style::new().fg(theme::LANG)),
                     Cell::from(book.size_human()).style(theme::faint()),
                     Cell::from(format!(" {} ", book.ext())).style(chip),
-                    Cell::from(job_label(job)).style(job_style(job)),
+                    Cell::from(status_text).style(status_style),
                 ])
                 // The zebra: alternate rows sit one step off the canvas, so a
                 // wide row can be followed without a ruler.
@@ -1848,10 +2223,16 @@ impl App {
             return;
         }
 
-        let mut lines = vec![Line::from(Span::styled(
-            self.status.clone() + if self.busy { "…" } else { "" },
-            theme::muted(),
-        ))];
+        let mut lines = vec![if self.busy {
+            // A turning spinner beside the status says "working", where a
+            // trailing ellipsis only ever sat still.
+            Line::from(vec![
+                Span::styled(format!("{} ", spinner_frame(self.spinner)), theme::accent()),
+                Span::styled(self.status.clone(), theme::muted()),
+            ])
+        } else {
+            Line::from(Span::styled(self.status.clone(), theme::muted()))
+        }];
         if !self.busy && self.results.is_empty() && self.mode != Mode::Editing {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -1969,13 +2350,15 @@ impl App {
                     format!("✗ {e}"),
                     Style::new().fg(theme::DANGER),
                 ))),
-                Some(Job::Running { done, total }) => lines.push(Line::from(Span::styled(
-                    progress_bar(*done, *total, 28),
-                    Style::new().fg(theme::ACCENT),
-                ))),
-                Some(Job::Queued) => {
-                    lines.push(Line::from(Span::styled("queued", theme::faint())))
-                }
+                Some(Job::Running {
+                    done,
+                    total,
+                    started,
+                }) => lines.push(progress_line(*done, *total, *started, 24)),
+                Some(Job::Queued) => lines.push(Line::from(vec![
+                    Span::styled(spinner_frame(self.spinner), theme::accent()),
+                    Span::styled(" queued", theme::faint()),
+                ])),
                 None => lines.push(Line::from(vec![
                     Span::styled("⏎ download → ", theme::accent()),
                     Span::styled(self.settings.dest_dir.display().to_string(), theme::faint()),
@@ -2094,13 +2477,20 @@ impl App {
                     format!("✗ {e}"),
                     Style::new().fg(theme::DANGER),
                 ))),
-                Some(Job::Running { done, total }) => lines.push(Line::from(Span::styled(
-                    progress_bar(*done, *total, (body.width as usize).saturating_sub(16)),
-                    Style::new().fg(theme::ACCENT),
-                ))),
-                Some(Job::Queued) => {
-                    lines.push(Line::from(Span::styled("queued", theme::faint())))
-                }
+                Some(Job::Running {
+                    done,
+                    total,
+                    started,
+                }) => lines.push(progress_line(
+                    *done,
+                    *total,
+                    *started,
+                    (body.width as usize).saturating_sub(4).clamp(8, 20),
+                )),
+                Some(Job::Queued) => lines.push(Line::from(vec![
+                    Span::styled(spinner_frame(self.spinner), theme::accent()),
+                    Span::styled(" queued", theme::faint()),
+                ])),
                 None => lines.push(Line::from(vec![
                     Span::styled("⏎ download → ", theme::accent()),
                     Span::styled(self.settings.dest_dir.display().to_string(), theme::faint()),
@@ -2159,11 +2549,19 @@ impl App {
 
         match self.covers.get(self.focused_md5().as_deref().unwrap_or("")) {
             Some(Slot::Looking) => {
+                // The spinner sits on the row that a cover's centre would fall
+                // on, so the frame reads as "loading" rather than empty.
+                let middle = Rect {
+                    x: area.x,
+                    y: area.y + area.height / 2,
+                    width: area.width,
+                    height: 1,
+                };
                 frame.render_widget(
-                    Paragraph::new("…")
+                    Paragraph::new(spinner_frame(self.spinner))
                         .style(theme::faint())
                         .alignment(Alignment::Center),
-                    area,
+                    middle,
                 );
             }
             Some(Slot::Ready(art)) if !self.protocol.is_pixels() => {
@@ -2202,6 +2600,12 @@ impl App {
             self.render_empty_library(frame, area);
             return;
         }
+        let area = self.with_scrollbar(
+            frame,
+            area,
+            self.shown.len(),
+            self.library_table.selected().unwrap_or(0),
+        );
         let now = history::now();
 
         let header = Row::new([
@@ -2549,6 +2953,7 @@ impl App {
                 ("⏎", "download"),
                 ("e", "format"),
                 ("l", "language"),
+                ("s", "sort"),
                 ("/", "search"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -2558,6 +2963,7 @@ impl App {
                 ("↑↓", "move"),
                 ("⏎", "open"),
                 ("f", "reveal"),
+                ("s", "sort"),
                 ("/", "filter"),
                 ("d", "forget"),
                 ("?", "help"),
@@ -2593,6 +2999,8 @@ impl App {
                     ("↑ ↓  k j", "move the selection"),
                     ("PgUp PgDn", "move ten at a time"),
                     ("g  G", "jump to first / last"),
+                    ("s  S", "cycle the sort / reverse it"),
+                    ("y", "copy the MD5 to the clipboard"),
                     ("?", "this help"),
                     ("q  esc", "quit"),
                     ("^c", "quit from anywhere"),
@@ -2715,10 +3123,30 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// The first of several semicolon-separated authors, lowercased for sorting
+/// and comparison. Empty when there is no author at all.
+fn first_author_of(authors: Option<&str>) -> String {
+    let all = authors.unwrap_or("");
+    all.split(';').next().unwrap_or(all).trim().to_lowercase()
+}
+
+/// The leading four-ish digits of a year string as a number, zero when there
+/// is nothing parseable — so undated books sink to one end rather than
+/// scattering. Libgen years are ragged (`1965`, `1965-01`, `c. 1965`).
+fn year_num(year: Option<&str>) -> u32 {
+    let s = year.unwrap_or("");
+    let digits: String = s
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().unwrap_or(0)
+}
+
 fn job_label(job: Option<&Job>) -> String {
     match job {
         Some(Job::Queued) => "queued".into(),
-        Some(Job::Running { done, total }) => match total {
+        Some(Job::Running { done, total, .. }) => match total {
             Some(t) if *t > 0 => format!("{:>3}%", (*done as f64 / *t as f64 * 100.0) as u32),
             _ => human_bytes(*done),
         },
@@ -2737,22 +3165,105 @@ fn job_style(job: Option<&Job>) -> Style {
     }
 }
 
-/// A text progress bar for the details pane.
-fn progress_bar(done: u64, total: Option<u64>, width: usize) -> String {
+/// The frames of the small in-flight spinner, one braille cell each. Picked to
+/// read as a smooth rotation at the few-frames-a-second the loop redraws at.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The spinner glyph for a given frame count.
+fn spinner_frame(tick: usize) -> &'static str {
+    SPINNER[tick % SPINNER.len()]
+}
+
+/// A fractional-block meter `width` cells wide. The fill is measured in
+/// eighths of a cell and the boundary drawn with a partial block, so the bar
+/// moves a step at a time rather than jumping a whole character — the extra
+/// resolution is free and reads as far smoother.
+fn meter(fraction: f64, width: usize) -> String {
+    const PARTIAL: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let eighths = (fraction.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
+    let full = eighths / 8;
+    let rem = eighths % 8;
+    let mut bar = "█".repeat(full.min(width));
+    let mut used = full.min(width);
+    if rem > 0 && used < width {
+        bar.push(PARTIAL[rem]);
+        used += 1;
+    }
+    bar.push_str(&"░".repeat(width.saturating_sub(used)));
+    bar
+}
+
+/// The download line for a detail pane: a fractional-block meter, the
+/// transferred and total size, and — once enough has come down to judge one —
+/// a live speed and estimate of the time left. The meter rides in the accent;
+/// the figures beside it stay faint, so the bar is what the eye tracks.
+fn progress_line(done: u64, total: Option<u64>, started: Instant, width: usize) -> Line<'static> {
+    let secs = started.elapsed().as_secs_f64();
+    // A speed judged in the first half-second swings wildly; wait for it.
+    let speed = (secs > 0.5).then(|| done as f64 / secs);
+    let rate = match speed {
+        Some(bytes) if bytes >= 1.0 => format!("{}/s", human_bytes(bytes as u64)),
+        _ => String::new(),
+    };
+
     match total {
         Some(total) if total > 0 => {
-            let fraction = (done as f64 / total as f64).clamp(0.0, 1.0);
-            let filled = (fraction * width as f64).round() as usize;
-            format!(
-                "{}{}  {}/{}",
-                "█".repeat(filled),
-                "░".repeat(width - filled),
+            let fraction = done as f64 / total as f64;
+            // Whole seconds left at the current average, once there is a rate.
+            let eta = speed
+                .filter(|s| *s > 0.0)
+                .map(|s| ((total.saturating_sub(done)) as f64 / s) as u64)
+                .map(|left| format!("  ·  {} left", short_duration(left)))
+                .unwrap_or_default();
+            let tail = format!(
+                "  {} / {}{}{}",
                 human_bytes(done),
-                human_bytes(total)
-            )
+                human_bytes(total),
+                if rate.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ·  {rate}")
+                },
+                eta,
+            );
+            Line::from(vec![
+                Span::styled(meter(fraction, width), theme::accent()),
+                Span::styled(tail, theme::faint()),
+            ])
         }
-        _ => format!("downloading… {}", human_bytes(done)),
+        // No total advertised: no bar to draw, just what has arrived so far.
+        _ => {
+            let tail = if rate.is_empty() {
+                String::new()
+            } else {
+                format!("  ·  {rate}")
+            };
+            Line::from(vec![
+                Span::styled(format!("downloading… {}", human_bytes(done)), theme::accent()),
+                Span::styled(tail, theme::faint()),
+            ])
+        }
     }
+}
+
+/// A compact duration for an ETA: `45s`, `3m 20s`, `1h 05m`.
+fn short_duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// Put text on the system clipboard with an OSC 52 escape. Base64 is the
+/// encoding the sequence mandates, and the crate already has an encoder for the
+/// image protocols, so this borrows it rather than growing a dependency.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let escape = format!("\x1b]52;c;{}\x07", graphics::base64(text.as_bytes()));
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "{escape}");
+    let _ = stdout.flush();
 }
 
 /// Error chains get long; the pane has one line for them.
@@ -2797,6 +3308,8 @@ mod tests {
             visible: Vec::new(),
             fmt_filter: None,
             lang_filter: None,
+            sort: Sort::Relevance,
+            sort_desc: false,
             table: TableState::default(),
             marked: Vec::new(),
             jobs: HashMap::new(),
@@ -2811,6 +3324,7 @@ mod tests {
             tx,
             library: Vec::new(),
             shown: Vec::new(),
+            owned: HashSet::new(),
             library_table: TableState::default(),
             // Tests draw to an off-screen buffer, so nothing may try to write
             // an escape sequence to a terminal that is not there.
@@ -2819,6 +3333,7 @@ mod tests {
             cover_due: None,
             painted: None,
             cover_area: None,
+            spinner: 0,
         }
     }
 
@@ -2843,6 +3358,24 @@ mod tests {
         a.results = list;
         a.table.select(None);
         a.refine();
+    }
+
+    /// The titles currently on screen, in display order.
+    fn titles(a: &App) -> Vec<String> {
+        a.visible
+            .iter()
+            .map(|&i| a.results[i].title.clone())
+            .collect()
+    }
+
+    fn book(md5: &str, title: &str, year: &str, size: u64) -> Book {
+        Book {
+            md5: md5.into(),
+            title: title.into(),
+            year: Some(year.into()),
+            size_bytes: Some(size),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -2961,6 +3494,153 @@ mod tests {
     }
 
     #[test]
+    fn sorting_reorders_the_list_and_keeps_the_selection() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(
+            &mut a,
+            vec![
+                book("00000000000000000000000000000001", "Charlie", "2001", 300),
+                book("00000000000000000000000000000002", "alpha", "1999", 100),
+                book("00000000000000000000000000000003", "Bravo", "2010", 200),
+            ],
+        );
+        // Relevance is the order the mirror returned.
+        assert_eq!(titles(&a), ["Charlie", "alpha", "Bravo"]);
+
+        // Rest the cursor on a book, then sort by title: it must follow.
+        a.table.select(Some(1));
+        assert_eq!(a.selected().unwrap().title, "alpha");
+        a.cycle_sort(); // Relevance -> Title, ascending, case-insensitive
+        assert_eq!(a.sort, Sort::Title);
+        assert_eq!(titles(&a), ["alpha", "Bravo", "Charlie"]);
+        assert_eq!(
+            a.selected().unwrap().title,
+            "alpha",
+            "the highlight tracks its book across a re-sort"
+        );
+
+        a.cycle_sort(); // -> Author (all equal here, so order is unchanged)
+        a.cycle_sort(); // -> Year, newest first by default
+        assert_eq!(a.sort, Sort::Year);
+        assert_eq!(titles(&a), ["Bravo", "Charlie", "alpha"]);
+
+        a.cycle_sort(); // -> Size, biggest first by default
+        assert_eq!(titles(&a), ["Charlie", "Bravo", "alpha"]);
+        a.reverse_sort(); // smallest first
+        assert_eq!(titles(&a), ["alpha", "Bravo", "Charlie"]);
+
+        a.cycle_sort(); // -> back to Relevance, closing the loop
+        assert_eq!(a.sort, Sort::Relevance);
+        assert_eq!(titles(&a), ["Charlie", "alpha", "Bravo"]);
+    }
+
+    #[test]
+    fn a_result_already_in_the_library_is_flagged() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        let owned = "1b9159991f7fb1b3910c0be9ebf7e595";
+        a.owned.insert(owned.into());
+        install(
+            &mut a,
+            vec![
+                Book {
+                    md5: owned.into(),
+                    title: "Owned Book".into(),
+                    extension: Some("epub".into()),
+                    ..Default::default()
+                },
+                Book {
+                    md5: "00000000000000000000000000000009".into(),
+                    title: "New Book".into(),
+                    extension: Some("epub".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        let screen = draw(&mut a, 100, 20);
+        let owned_row = screen
+            .lines()
+            .find(|l| l.contains("Owned Book"))
+            .unwrap_or("");
+        let new_row = screen.lines().find(|l| l.contains("New Book")).unwrap_or("");
+        assert!(
+            owned_row.contains("library"),
+            "an owned result should say so: {screen}"
+        );
+        assert!(
+            !new_row.contains("library"),
+            "a fresh result must not: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_marked_batch_reports_its_combined_size() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(
+            &mut a,
+            vec![
+                book("00000000000000000000000000000001", "A", "2000", 1024 * 1024),
+                book(
+                    "00000000000000000000000000000002",
+                    "B",
+                    "2000",
+                    3 * 1024 * 1024,
+                ),
+            ],
+        );
+        assert!(a.marked_summary().is_none());
+        a.marked = vec![true, true];
+        assert_eq!(a.marked_summary(), Some((2, 4 * 1024 * 1024)));
+        let screen = draw(&mut a, 100, 20);
+        assert!(screen.contains("2 marked"), "{screen}");
+    }
+
+    #[test]
+    fn y_copies_the_md5_to_the_status_line() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, books(2));
+        a.table.select(Some(1));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(
+            a.status.contains(&a.results[1].md5),
+            "the md5 should be named: {}",
+            a.status
+        );
+        assert!(a.status.contains("clipboard"));
+    }
+
+    #[test]
+    fn the_library_strip_summarises_the_shelf() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        a.tab = Tab::Library;
+        a.library = entries(3); // three 1 MB epubs
+        a.owned = a.library.iter().map(|e| e.md5.clone()).collect();
+        a.refilter();
+        let screen = draw(&mut a, 100, 20);
+        assert!(screen.contains("3 books"), "count missing: {screen}");
+        assert!(screen.contains("epub"), "format breakdown missing: {screen}");
+    }
+
+    #[test]
+    fn a_list_taller_than_the_screen_grows_a_scroll_indicator() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, books(50));
+        // A short terminal cannot show fifty rows, so the thumb appears. The
+        // full block is drawn nowhere else when no download is in flight.
+        let screen = draw(&mut a, 80, 12);
+        assert!(screen.contains('█'), "scroll thumb missing: {screen}");
+        // A list that fits keeps the whole width — no thumb.
+        install(&mut a, books(3));
+        let roomy = draw(&mut a, 80, 24);
+        assert!(!roomy.contains('█'), "no scrollbar when it all fits: {roomy}");
+    }
+
+    #[test]
     fn mode_switching_and_quitting() {
         let mut a = app();
         a.mode = Mode::Browsing;
@@ -3046,6 +3726,7 @@ mod tests {
             Job::Running {
                 done: 1,
                 total: None,
+                started: Instant::now(),
             },
         );
         a.handle(Ev::Finished {
@@ -3165,6 +3846,7 @@ mod tests {
             Job::Running {
                 done: 512 * 1024,
                 total: Some(1024 * 1024),
+                started: Instant::now(),
             },
         );
         let screen = draw(&mut a, 100, 20);
@@ -3173,13 +3855,24 @@ mod tests {
     }
 
     #[test]
-    fn progress_bar_renders_within_its_width() {
-        let bar = progress_bar(50, Some(100), 10);
+    fn the_meter_stays_within_its_width() {
+        // A half-full ten-cell meter is five full blocks and five track cells.
+        let bar = meter(0.5, 10);
         assert_eq!(bar.chars().filter(|c| *c == '█').count(), 5);
         assert_eq!(bar.chars().filter(|c| *c == '░').count(), 5);
-        // Unknown totals must not divide by zero or panic.
-        assert!(progress_bar(50, None, 10).contains("downloading"));
-        assert!(progress_bar(50, Some(0), 10).contains("downloading"));
+        // The fractional boundary never overruns the requested width.
+        assert_eq!(meter(0.37, 10).chars().count(), 10);
+        assert_eq!(meter(0.0, 8).chars().filter(|c| *c == '░').count(), 8);
+        assert_eq!(meter(1.0, 8).chars().filter(|c| *c == '█').count(), 8);
+        // Over-full is clamped rather than panicking.
+        assert_eq!(meter(2.0, 6).chars().count(), 6);
+    }
+
+    #[test]
+    fn an_eta_reads_compactly() {
+        assert_eq!(short_duration(45), "45s");
+        assert_eq!(short_duration(200), "3m 20s");
+        assert_eq!(short_duration(3900), "1h 05m");
     }
 
     fn entries(n: usize) -> Vec<history::Entry> {
@@ -3909,6 +4602,9 @@ mod tests {
         a.mirror_label = "libgen.li".into();
         a.protocol = Protocol::Blocks;
         a.library = entries(7); // so the tab bar carries a believable count
+        // The first few library entries share the leading MD5s with the search
+        // results, so those editions show as already on the shelf.
+        a.owned = a.library.iter().map(|e| e.md5.clone()).collect();
         install(&mut a, kapital());
         a.covers.insert(
             "00000000000000000000000000000000".into(),
@@ -3926,6 +4622,7 @@ mod tests {
             Job::Running {
                 done: 2_400_000,
                 total: Some(5_200_000),
+                started: Instant::now(),
             },
         );
         a.marked[9] = true;
@@ -3943,10 +4640,13 @@ mod tests {
         );
         page.push_str(&html(&mut a, 132, 42, "Search — filtered to English"));
 
-        // 3. Both filters: English epubs.
+        // 3. Both filters: English epubs, sorted biggest-first to show the
+        // sort indicator carrying a direction.
         a.fmt_filter = Some("epub".into());
+        a.sort = Sort::Size;
+        a.sort_desc = true;
         a.refine();
-        page.push_str(&html(&mut a, 132, 42, "Search — English epubs only"));
+        page.push_str(&html(&mut a, 132, 42, "Search — English epubs, by size"));
 
         // 4. Narrow terminal, bottom strip.
         page.push_str(&html(&mut a, 90, 28, "Search — narrow (80–100 col) layout"));
@@ -4015,7 +4715,8 @@ mod tests {
         assert_eq!(
             job_label(Some(&Job::Running {
                 done: 25,
-                total: Some(100)
+                total: Some(100),
+                started: Instant::now(),
             })),
             " 25%"
         );
