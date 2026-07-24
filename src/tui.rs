@@ -688,7 +688,7 @@ impl App {
     /// MD5, so its cover comes off a mirror; a library book is a file on disk
     /// that usually carries its own jacket, so that is read straight out of the
     /// file with no network at all — falling back to the cache from a past
-    /// search when the file has none of its own.
+    /// search, and then to a mirror, when the file has none of its own.
     fn poll_cover(&mut self) {
         let Some(due) = self.cover_due else {
             return;
@@ -742,8 +742,17 @@ impl App {
         });
     }
 
-    /// Read the highlighted library book's cover out of the file itself, or
-    /// the cache when the file carries none. No mirror is touched.
+    /// Find the highlighted library book's cover, cheapest source first.
+    ///
+    /// Three places, in order: the jacket embedded in the file you downloaded
+    /// (no network, and it is the book you actually have); a cover cached from a
+    /// past search of the same book; and finally the mirror, the same way the
+    /// Search tab does it. The mirror fallback matters because most formats
+    /// carry no cover this can extract — a PDF has no embedded jacket at all,
+    /// and plenty of real EPUBs and MOBIs hide theirs where the heuristics miss
+    /// — so without it those books would sit in the library with a blank frame
+    /// forever. The fetch caches to disk, so a book is only pulled off a mirror
+    /// once.
     fn spawn_library_cover(&mut self, md5: String) {
         let Some(entry) = self.selected_entry().cloned() else {
             return;
@@ -751,19 +760,50 @@ impl App {
         self.covers.insert(md5.clone(), Slot::Looking);
 
         let tx = self.tx.clone();
+        let settings = self.settings.clone();
+        let mirrors = self.mirrors.clone();
         std::thread::spawn(move || {
-            // The file's own cover first; it is the book you actually have.
-            let found = entry
+            // The file's own cover first, then a cover cached from a past search.
+            let local = entry
                 .present()
                 .then(|| crate::embedded::cover(&entry.path))
                 .flatten()
-                // Then a cover cached from a past search of the same book.
                 .or_else(|| cover::cached(&md5).flatten());
+
+            // Nothing on disk: ask a mirror, exactly as the Search tab would,
+            // building a lookup key out of what the history row remembers.
+            let result = match local {
+                Some(cover) => Ok(Some(cover)),
+                None => Self::fetch_library_cover(&settings, &mirrors, &entry),
+            };
             let _ = tx.send(Ev::Cover {
                 md5,
-                result: Ok(found),
+                result: result.map_err(|e| e.to_string()),
             });
         });
+    }
+
+    /// Pull a library book's cover off a mirror, keyed by its MD5. Returns
+    /// `Ok(None)` when there is simply no mirror to ask or the record has no
+    /// cover; both leave the frame empty rather than showing an error over a
+    /// book someone already has.
+    fn fetch_library_cover(
+        settings: &Settings,
+        mirrors: &[Uri],
+        entry: &history::Entry,
+    ) -> Result<Option<Cover>> {
+        let Some(base) = mirrors.first().cloned() else {
+            return Ok(None);
+        };
+        let book = Book {
+            md5: entry.md5.clone(),
+            title: entry.title.clone(),
+            authors: entry.authors.clone(),
+            extension: entry.extension.clone(),
+            ..Default::default()
+        };
+        let http = Http::new(settings.policy)?;
+        cover::fetch(&http, &base, &book)
     }
 
     /// The MD5 of whatever is highlighted on the current tab — a search result
@@ -1062,11 +1102,19 @@ impl App {
                     .and_then(|u| net::host_of(u).ok())
                     .unwrap_or_else(|| "none".into());
                 let count = mirrors.len();
+                let first_mirror = self.mirrors.is_empty() && count > 0;
                 self.mirrors = mirrors;
                 self.status = format!("{count} mirror(s) available");
                 if self.pending_search {
                     self.pending_search = false;
                     self.spawn_search();
+                }
+                // A library cover that came up empty while there was no mirror
+                // to ask deserves another go now that there is one; drop those
+                // blanks and re-arm the selection so it looks again.
+                if first_mirror {
+                    self.covers.retain(|_, slot| !matches!(slot, Slot::Nothing));
+                    self.selection_moved();
                 }
             }
             Ev::Mirrors(Err(e)) => {
@@ -3203,6 +3251,50 @@ mod tests {
         assert!(
             narrow.contains(graphics::UPPER_HALF),
             "the narrow strip should still show the cover: {narrow}"
+        );
+    }
+
+    #[test]
+    fn a_library_cover_with_no_local_source_falls_back_to_a_mirror() {
+        // The whole point of the fallback: a book whose file carries no jacket
+        // and that was never searched must still get a cover off a mirror, the
+        // same way the Search tab does. With no mirror there is nothing to ask,
+        // so it comes back empty rather than erroring.
+        let a = app();
+        let entry = &entries(1)[0];
+        assert!(
+            App::fetch_library_cover(&a.settings, &[], entry)
+                .unwrap()
+                .is_none(),
+            "no mirror, no cover, but no error either"
+        );
+    }
+
+    #[test]
+    fn a_mirror_arriving_revives_library_covers_that_had_none_to_ask() {
+        // Open the library before the mirror pool resolves: a book with no
+        // local cover comes up blank because there was nobody to ask. When the
+        // mirror lands, that blank must be dropped and the selection re-armed so
+        // the cover is looked up for real.
+        let mut a = app();
+        a.protocol = Protocol::Kitty;
+        with_library(&mut a, entries(1));
+        a.library_table.select(Some(0));
+        let md5 = a.selected_entry().unwrap().md5.clone();
+
+        // Stands in for the empty result of a mirror-less first look.
+        a.covers.insert(md5.clone(), Slot::Nothing);
+        a.cover_due = None;
+
+        a.handle(Ev::Mirrors(Ok(vec!["https://libgen.li".parse().unwrap()])));
+
+        assert!(
+            !a.covers.contains_key(&md5),
+            "the blank cover should be dropped so it can be looked up again"
+        );
+        assert!(
+            a.cover_due.is_some(),
+            "the selection should be re-armed to fetch now a mirror exists"
         );
     }
 
