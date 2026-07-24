@@ -1965,18 +1965,6 @@ impl App {
         self.cover_area
     }
 
-    /// Whether the list earns its tall side panel: enough columns for the rows
-    /// to keep breathing next to a poster-sized cover, and something to show.
-    fn side_panel(&self, area: Rect) -> bool {
-        if area.width < 110 {
-            return false;
-        }
-        match self.tab {
-            Tab::Search => !self.results.is_empty(),
-            Tab::Library => !self.shown.is_empty(),
-        }
-    }
-
     fn render(&mut self, frame: &mut Frame) {
         // One tick per frame drives every animated glyph on screen. The loop
         // wakes on a 250 ms timer even when idle, so it advances calmly.
@@ -2001,11 +1989,13 @@ impl App {
         if landing {
             self.render_landing(frame, area);
         } else {
-            let side = self.side_panel(area);
-            // A control strip rides directly on top of the box: the facets, sort
-            // and counts on Search; the sort and a one-line shelf summary on
-            // Library. Gathering everything you type with at the bottom is what
-            // keeps the two tabs reading as one interface.
+            // The record for the selected row lies as a horizontal band across
+            // the bottom rather than a column down the side, so the results keep
+            // the full width of the screen and the table never fights a panel
+            // for room. A control strip rides directly on top of the search box:
+            // the facets, sort and counts on Search; the sort and a one-line
+            // shelf summary on Library. Gathering everything you type with at the
+            // foot is what keeps the two tabs reading as one interface.
             let filter_bar = match self.tab {
                 Tab::Search => !self.results.is_empty(),
                 Tab::Library => !self.library.is_empty(),
@@ -2014,14 +2004,14 @@ impl App {
                 Tab::Search => self.visible.is_empty(),
                 Tab::Library => self.shown.is_empty(),
             };
-            let details = if side || (empty_tab && self.error.is_none()) {
+            let details = if empty_tab && self.error.is_none() {
                 0
             } else {
                 self.details_height(area)
             };
             let chunks = Layout::vertical([
                 Constraint::Min(3),             // results / library body
-                Constraint::Length(details),    // details strip (narrow layout)
+                Constraint::Length(details),    // details band
                 Constraint::Length(filter_bar), // facets / shelf summary + sort
                 Constraint::Length(3),          // search box
                 Constraint::Length(1),          // key hints
@@ -2029,21 +2019,6 @@ impl App {
             .split(area);
 
             match self.tab {
-                _ if side => {
-                    let columns =
-                        Layout::horizontal([Constraint::Min(40), Constraint::Length(42)])
-                            .split(chunks[0]);
-                    match self.tab {
-                        Tab::Search => {
-                            self.render_results(frame, columns[0]);
-                            self.render_side_details(frame, columns[1]);
-                        }
-                        Tab::Library => {
-                            self.render_library(frame, columns[0]);
-                            self.render_library_side_details(frame, columns[1]);
-                        }
-                    }
-                }
                 Tab::Search => {
                     self.render_results(frame, chunks[0]);
                     self.render_details(frame, chunks[1]);
@@ -2998,172 +2973,6 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
-    /// The tall right-hand panel of the wide layout: the cover at something
-    /// like poster size, then the record beneath it as labelled rows — a
-    /// jacket flap rather than a footnote.
-    fn render_side_details(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(theme::FAINT));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if inner.width < 10 || inner.height < 6 {
-            return;
-        }
-
-        let Some(book) = self.selected().cloned() else {
-            let hint = self
-                .error
-                .clone()
-                .unwrap_or_else(|| "no selection".to_string());
-            let style = if self.error.is_some() {
-                Style::new().fg(theme::DANGER)
-            } else {
-                theme::faint()
-            };
-            frame.render_widget(
-                Paragraph::new(hint)
-                    .style(style)
-                    .alignment(Alignment::Center)
-                    .wrap(Wrap { trim: true }),
-                inner.inner(Margin {
-                    horizontal: 1,
-                    vertical: inner.height / 2,
-                }),
-            );
-            return;
-        };
-
-        let text_top = self.place_cover(frame, inner, &book.md5);
-
-        let body = Rect {
-            x: inner.x + 1,
-            y: text_top,
-            width: inner.width.saturating_sub(2),
-            height: inner.bottom().saturating_sub(text_top),
-        };
-        if body.height == 0 {
-            return;
-        }
-
-        let fact = |label: &str, value: Span<'static>| {
-            Line::from(vec![
-                Span::styled(format!("{label:<10}"), theme::faint()),
-                value,
-            ])
-        };
-        let mut lines = vec![
-            Line::from(Span::styled(
-                book.title.clone(),
-                theme::text().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                book.authors_or_unknown().to_string(),
-                theme::muted(),
-            )),
-            Line::from(""),
-        ];
-        if let Some(p) = book.publisher.as_deref().filter(|s| !s.is_empty()) {
-            lines.push(fact("publisher", Span::styled(p.to_string(), theme::muted())));
-        }
-        if let Some(y) = book.year.as_deref().filter(|s| !s.is_empty()) {
-            lines.push(fact("year", Span::styled(y.to_string(), theme::muted())));
-        }
-        if let Some(l) = book.language.as_deref().filter(|s| !s.is_empty()) {
-            lines.push(fact(
-                "language",
-                Span::styled(l.to_string(), Style::new().fg(theme::LANG)),
-            ));
-        }
-        if let Some(p) = book.pages.as_deref().filter(|s| !s.is_empty() && *s != "0") {
-            lines.push(fact("pages", Span::styled(p.to_string(), theme::muted())));
-        }
-        if !book.size_human().is_empty() {
-            lines.push(fact("size", Span::styled(book.size_human(), theme::muted())));
-        }
-        lines.push(fact(
-            "format",
-            Span::styled(format!(" {} ", book.ext()), theme::format_chip(book.ext())),
-        ));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(book.md5.clone(), theme::faint())));
-        lines.push(Line::from(""));
-
-        // The most urgent thing about the selection last, where the eye rests:
-        // an error, else this file's download state.
-        if let Some(error) = &self.error {
-            lines.push(Line::from(Span::styled(
-                error.clone(),
-                Style::new().fg(theme::DANGER),
-            )));
-        } else {
-            match self.jobs.get(&book.md5) {
-                Some(Job::Saved(name)) => lines.push(Line::from(Span::styled(
-                    format!("✓ saved as {name}"),
-                    Style::new().fg(theme::SUCCESS),
-                ))),
-                Some(Job::Failed(e)) => lines.push(Line::from(Span::styled(
-                    format!("✗ {e}"),
-                    Style::new().fg(theme::DANGER),
-                ))),
-                Some(Job::Running {
-                    done,
-                    total,
-                    started,
-                }) => lines.push(progress_line(
-                    *done,
-                    *total,
-                    *started,
-                    (body.width as usize).saturating_sub(4).clamp(8, 20),
-                )),
-                Some(Job::Queued) => lines.push(Line::from(vec![
-                    Span::styled(spinner_frame(self.spinner), theme::accent()),
-                    Span::styled(" queued", theme::faint()),
-                ])),
-                None => lines.push(Line::from(vec![
-                    Span::styled("⏎ download → ", theme::accent()),
-                    Span::styled(self.settings.dest_dir.display().to_string(), theme::faint()),
-                ])),
-            }
-        }
-
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
-    }
-
-    /// Place the cover for `md5` across the top of `inner`, and return the row
-    /// where the text beneath it should begin. Sized to the picture's own shape
-    /// once that is known and to a 2:3 jacket until then, centred, and capped
-    /// so the record below always keeps its ten lines. A book with no cover
-    /// gets a quiet empty jacket so the panel does not jump when one arrives.
-    fn place_cover(&mut self, frame: &mut Frame, inner: Rect, md5: &str) -> u16 {
-        if self.protocol == Protocol::None {
-            return inner.y;
-        }
-        let (art_w, art_h) = match self.covers.get(md5) {
-            Some(Slot::Ready(art)) => art
-                .pixels
-                .as_ref()
-                .map(|p| (p.width.max(1) as u32, p.height.max(1) as u32))
-                .unwrap_or((2, 3)),
-            _ => (2, 3),
-        };
-        let max_height = inner.height.saturating_sub(11).clamp(6, 21);
-        let max_width = inner.width.saturating_sub(2);
-        let width = max_width.min((max_height as u32 * 2 * art_w / art_h) as u16);
-        let height = ((width as u32 * art_h).div_ceil(art_w * 2) as u16).min(max_height);
-        let rect = Rect {
-            x: inner.x + (inner.width - width) / 2,
-            y: inner.y,
-            width,
-            height,
-        };
-        match self.covers.get(md5) {
-            Some(Slot::Ready(_)) | Some(Slot::Looking) => self.render_cover(frame, rect),
-            _ => render_cover_placeholder(frame, rect),
-        }
-        rect.bottom() + 1
-    }
-
     /// Draw the cover, or reserve the space it is about to occupy.
     ///
     /// For the two pixel protocols this only records where the picture goes;
@@ -3475,93 +3284,6 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
-    /// The wide library panel: the book's own cover near poster size, then
-    /// where the file is and what is known about it — the same jacket-flap
-    /// layout the search tab uses, sourced from the file instead of a mirror.
-    fn render_library_side_details(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(theme::FAINT));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if inner.width < 10 || inner.height < 6 {
-            return;
-        }
-
-        let Some(entry) = self.selected_entry().cloned() else {
-            return;
-        };
-
-        let text_top = self.place_cover(frame, inner, &entry.md5);
-        let body = Rect {
-            x: inner.x + 1,
-            y: text_top,
-            width: inner.width.saturating_sub(2),
-            height: inner.bottom().saturating_sub(text_top),
-        };
-        if body.height == 0 {
-            return;
-        }
-
-        let fact = |label: &str, value: Span<'static>| {
-            Line::from(vec![
-                Span::styled(format!("{label:<9}"), theme::faint()),
-                value,
-            ])
-        };
-        let mut lines = vec![
-            Line::from(Span::styled(
-                entry.title.clone(),
-                theme::text().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                entry.authors.clone().unwrap_or_default(),
-                theme::muted(),
-            )),
-            Line::from(""),
-            fact(
-                "format",
-                Span::styled(format!(" {} ", entry.ext()), theme::format_chip(entry.ext())),
-            ),
-            fact("size", Span::styled(human_bytes(entry.size), theme::muted())),
-            fact(
-                "added",
-                Span::styled(history::timestamp(entry.at), theme::muted()),
-            ),
-            fact(
-                "checksum",
-                if entry.verified {
-                    Span::styled("✓ MD5 verified", Style::new().fg(theme::SUCCESS))
-                } else {
-                    Span::styled("unverified", theme::faint())
-                },
-            ),
-            Line::from(""),
-            Line::from(Span::styled("saved to", theme::faint())),
-            Line::from(Span::styled(entry.path.display().to_string(), theme::faint())),
-            Line::from(""),
-        ];
-
-        if let Some(error) = &self.error {
-            lines.push(Line::from(Span::styled(
-                error.clone(),
-                Style::new().fg(theme::DANGER),
-            )));
-        } else if !entry.present() {
-            lines.push(Line::from(Span::styled(
-                "⚠ the file is no longer there — d to forget it",
-                Style::new().fg(theme::DANGER),
-            )));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("⏎ open", theme::accent()),
-                Span::styled("    f reveal", theme::faint()),
-            ]));
-        }
-
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
-    }
-
     fn render_hints(&self, frame: &mut Frame, area: Rect) {
         // Each hint is a (key, label) pair; the key rides in the accent, the
         // label sits faint beneath it, so the bar reads as a legend rather than
@@ -3722,29 +3444,6 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(lines), inner);
-    }
-}
-
-/// Where a cover would go when the book has none: a quiet empty jacket, so the
-/// panel keeps its shape instead of jumping when a picture does arrive.
-fn render_cover_placeholder(frame: &mut Frame, area: Rect) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme::FAINT));
-    frame.render_widget(&block, area);
-    if area.height >= 3 {
-        let middle = Rect {
-            x: area.x,
-            y: area.y + area.height / 2,
-            width: area.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new("no cover")
-                .style(theme::faint())
-                .alignment(Alignment::Center),
-            middle,
-        );
     }
 }
 
@@ -4716,21 +4415,16 @@ mod tests {
             })),
         );
 
-        // Wide: the poster panel, with the cover and the file facts beside it.
-        let wide = draw(&mut a, 130, 40);
-        assert!(
-            wide.contains(graphics::UPPER_HALF),
-            "the library cover should draw as half blocks: {wide}"
-        );
-        assert!(wide.contains("Book 0"), "{wide}");
-        assert!(wide.contains("saved to"), "{wide}");
-
-        // Narrow: the bottom strip grows a cover column too.
-        let narrow = draw(&mut a, 90, 24);
-        assert!(
-            narrow.contains(graphics::UPPER_HALF),
-            "the narrow strip should still show the cover: {narrow}"
-        );
+        // The bottom band grows a cover column beside the file facts, wide or
+        // narrow — the same horizontal layout at either size.
+        for (w, h) in [(130u16, 40u16), (90, 24)] {
+            let screen = draw(&mut a, w, h);
+            assert!(
+                screen.contains(graphics::UPPER_HALF),
+                "{w}x{h}: the library cover should draw as half blocks: {screen}"
+            );
+            assert!(screen.contains("Book 0"), "{w}x{h}: {screen}");
+        }
     }
 
     #[test]
@@ -5285,7 +4979,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_terminal_gets_the_side_panel() {
+    fn the_selection_reads_along_the_bottom_band() {
         let mut a = app();
         a.mode = Mode::Browsing;
         install(
@@ -5304,16 +4998,18 @@ mod tests {
             }],
         );
 
-        // Wide: the record reads as labelled rows in the right-hand panel.
-        let screen = draw(&mut a, 130, 40);
-        assert!(screen.contains("publisher"), "{screen}");
-        assert!(screen.contains("Harper & Row"), "{screen}");
-        assert!(screen.contains("1b9159991f7fb1b3910c0be9ebf7e595"), "{screen}");
-
-        // Narrow: the old bottom strip, nothing lost.
-        let screen = draw(&mut a, 90, 24);
-        assert!(screen.contains("The Dispossessed"), "{screen}");
-        assert!(screen.contains("1b9159991f7fb1b3910c0be9ebf7e595"), "{screen}");
+        // The record for the selected row lies in the horizontal band across the
+        // bottom, so the results keep the whole width — at any terminal size the
+        // title, the publisher and the checksum are all there to read.
+        for (w, h) in [(130u16, 40u16), (90, 24)] {
+            let screen = draw(&mut a, w, h);
+            assert!(screen.contains("The Dispossessed"), "{w}x{h}: {screen}");
+            assert!(screen.contains("Harper & Row"), "{w}x{h}: {screen}");
+            assert!(
+                screen.contains("1b9159991f7fb1b3910c0be9ebf7e595"),
+                "{w}x{h}: {screen}"
+            );
+        }
     }
 
     /// Render the app to styled HTML for out-of-terminal design review.
