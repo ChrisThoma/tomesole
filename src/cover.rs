@@ -59,6 +59,13 @@ impl Cover {
         }
     }
 
+    /// Wrap raw image bytes as a cover, identifying the format from its
+    /// signature and rejecting anything that is not actually an image. Used by
+    /// the network path and by covers pulled out of a book file on disk.
+    pub fn from_bytes(bytes: Vec<u8>) -> Option<Cover> {
+        Self::classify(bytes)
+    }
+
     fn classify(bytes: Vec<u8>) -> Option<Cover> {
         let kind = if jpeg::is_jpeg(&bytes) {
             Kind::Jpeg
@@ -198,6 +205,15 @@ const MISSING: &str = "none";
 
 fn cache_path(md5: &str, extension: &str) -> PathBuf {
     crate::config::cover_cache_dir().join(format!("{md5}.{extension}"))
+}
+
+/// The cover for this MD5 if one was fetched in a past search, without going
+/// near the network. `Some(None)` means "looked before, there is none".
+///
+/// This is what lets the library show a cover for a book whose file carries
+/// none of its own: if you saw it while searching, it is already on disk.
+pub fn cached(md5: &str) -> Option<Option<Cover>> {
+    from_cache(md5)
 }
 
 /// `Some(None)` means "cached, and there is no cover"; `None` means "not

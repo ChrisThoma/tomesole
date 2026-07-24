@@ -29,27 +29,38 @@ use crate::{Settings, cover, download, history, launch, libgen, mirror, net, que
 
 /// The visual language, in one place so the whole interface stays coherent.
 ///
-/// One accent does the identifying — a calm teal that reads as "clibgen"
-/// wherever it appears — with a warm amber kept in reserve for the few things
-/// genuinely worth the eye: a file's format, the count of books you own. Text
-/// lives on three levels, primary through faint, so hierarchy comes from weight
-/// and not from a rainbow. Colours are true-colour on purpose: the interface
-/// commits to a look rather than inheriting whatever sixteen colours the
-/// terminal happened to be set to.
+/// The interface paints its own canvas — a deep blue-grey — rather than
+/// inheriting the terminal background, so contrast is something it owns.
+/// Colour then carries meaning: teal is interactive (the cursor, the keys, the
+/// active tab), amber is emphasis (a narrowed count, a marked row), every file
+/// format keeps one hue of its own so a column of results reads at a glance,
+/// and languages share one calm blue because they are the other thing people
+/// narrow by. Text sits on three levels, primary through faint, so hierarchy
+/// comes from weight rather than a rainbow. Colours are true-colour on
+/// purpose: the interface commits to a look rather than inheriting whatever
+/// sixteen colours the terminal happened to be set to.
 mod theme {
     use ratatui::style::{Color, Modifier, Style};
 
-    pub const ACCENT: Color = Color::Rgb(94, 200, 205); // teal
-    pub const ACCENT_DEEP: Color = Color::Rgb(58, 138, 142);
-    pub const AMBER: Color = Color::Rgb(228, 184, 112);
-    pub const TEXT: Color = Color::Rgb(228, 231, 236);
-    pub const MUTED: Color = Color::Rgb(150, 158, 170);
-    pub const FAINT: Color = Color::Rgb(94, 101, 114);
-    pub const SUCCESS: Color = Color::Rgb(126, 199, 138);
-    pub const DANGER: Color = Color::Rgb(230, 112, 120);
-    /// The wash behind the highlighted row: a dark teal tint, dim enough to sit
-    /// under white text yet plainly not the background.
-    pub const SELECT_BG: Color = Color::Rgb(28, 46, 51);
+    /// The canvas painted under every frame.
+    pub const BG: Color = Color::Rgb(16, 20, 27);
+    /// Every other table row, one step off the canvas: enough for the eye to
+    /// track a row across a wide screen, not enough to read as stripes.
+    pub const BG_ALT: Color = Color::Rgb(22, 27, 36);
+    pub const ACCENT: Color = Color::Rgb(88, 216, 216); // teal — interactive
+    pub const ACCENT_DEEP: Color = Color::Rgb(56, 148, 152);
+    pub const AMBER: Color = Color::Rgb(242, 190, 106); // emphasis
+    pub const TEXT: Color = Color::Rgb(238, 241, 246);
+    pub const MUTED: Color = Color::Rgb(173, 181, 196);
+    pub const FAINT: Color = Color::Rgb(112, 121, 137);
+    pub const SUCCESS: Color = Color::Rgb(140, 220, 150);
+    pub const DANGER: Color = Color::Rgb(244, 120, 130);
+    /// Languages get one colour of their own — a calm blue — because they are
+    /// one of the two facets the interface filters by.
+    pub const LANG: Color = Color::Rgb(142, 180, 252);
+    /// The wash behind the highlighted row: a teal tint, bright enough to be
+    /// plainly the cursor, dim enough to sit under white text.
+    pub const SELECT_BG: Color = Color::Rgb(31, 54, 61);
 
     /// The gutter that marks the selected row. A solid bar reads as "here" even
     /// when the list holds a single item, which a mere background tint does not.
@@ -68,13 +79,33 @@ mod theme {
         Style::new().fg(ACCENT)
     }
 
-    /// The whole selected row. Cells that set their own colour keep it; the
-    /// tint and the accent gutter come from here.
-    pub fn selected_row() -> Style {
+    /// Each format keeps one hue everywhere it appears, so "the green ones are
+    /// epubs" becomes something the eye learns in seconds.
+    pub fn format_color(ext: &str) -> Color {
+        match ext.to_ascii_lowercase().as_str() {
+            "epub" => Color::Rgb(129, 201, 141),
+            "pdf" => Color::Rgb(240, 138, 126),
+            "mobi" | "azw" | "azw3" => Color::Rgb(235, 180, 100),
+            "djvu" => Color::Rgb(198, 160, 246),
+            "cbz" | "cbr" => Color::Rgb(240, 150, 200),
+            _ => Color::Rgb(148, 156, 170),
+        }
+    }
+
+    /// A format as a small solid chip: dark text on the format's hue.
+    pub fn format_chip(ext: &str) -> Style {
         Style::new()
-            .bg(SELECT_BG)
-            .fg(ACCENT)
+            .fg(BG)
+            .bg(format_color(ext))
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// The wash behind the selected row — and only the wash. The highlight is
+    /// applied over every cell, so anything set here would repaint the row's
+    /// own colours; the white title, the blue language and the format's hue
+    /// are the information, and selection must not flatten them into teal.
+    pub fn selected_row() -> Style {
+        Style::new().bg(SELECT_BG)
     }
 
     /// A column header: quiet, so the data below it does the talking.
@@ -180,6 +211,16 @@ pub struct App {
     /// character index. Clamped when the tab changes.
     caret: usize,
     results: Vec<Book>,
+    /// Indices into `results` that survive the format and language filters, in
+    /// display order. What the table actually shows.
+    visible: Vec<usize>,
+    /// Narrow the results to one file format, e.g. `epub`. Survives a new
+    /// search on purpose: "epubs only" is a standing preference, not a remark
+    /// about one result set.
+    fmt_filter: Option<String>,
+    /// Narrow the results to one language, matched exactly against what the
+    /// mirror reported.
+    lang_filter: Option<String>,
     table: TableState,
     marked: Vec<bool>,
     jobs: HashMap<String, Job>,
@@ -262,6 +303,9 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
         query,
         filter: String::new(),
         results: Vec::new(),
+        visible: Vec::new(),
+        fmt_filter: None,
+        lang_filter: None,
         table: TableState::default(),
         marked: Vec::new(),
         jobs: HashMap::new(),
@@ -409,7 +453,7 @@ impl App {
                 .map(|(b, _)| b.clone())
                 .collect()
         } else {
-            match self.table.selected().and_then(|i| self.results.get(i)) {
+            match self.selected() {
                 Some(book) => vec![book.clone()],
                 None => return,
             }
@@ -500,7 +544,135 @@ impl App {
 
     /// The record the detail pane is describing.
     fn selected(&self) -> Option<&Book> {
-        self.table.selected().and_then(|i| self.results.get(i))
+        self.table
+            .selected()
+            .and_then(|i| self.visible.get(i))
+            .and_then(|&i| self.results.get(i))
+    }
+
+    // --- narrowing the results --------------------------------------------
+    //
+    // A search brings back whatever the mirror has — Das Kapital is forty
+    // German editions with the English translations scattered among them.
+    // Rather than make people re-search with `lang:` tags, two facets carve
+    // the results in place: `e` cycles through the formats actually present,
+    // `l` through the languages, each shown with a live count of what
+    // choosing it would leave.
+
+    /// Does the current pair of filters admit this record?
+    fn admits(&self, book: &Book) -> bool {
+        self.fmt_admits(book) && self.lang_admits(book)
+    }
+
+    fn fmt_admits(&self, book: &Book) -> bool {
+        match &self.fmt_filter {
+            Some(want) => book.ext().eq_ignore_ascii_case(want),
+            None => true,
+        }
+    }
+
+    fn lang_admits(&self, book: &Book) -> bool {
+        match &self.lang_filter {
+            Some(want) => book
+                .language
+                .as_deref()
+                .unwrap_or("unknown")
+                .eq_ignore_ascii_case(want),
+            None => true,
+        }
+    }
+
+    /// Recompute which rows show, keeping the highlight on the same book when
+    /// it survives the cut and on the top row when it does not.
+    fn refine(&mut self) {
+        let keep = self.selected().map(|b| b.md5.clone());
+        self.visible = (0..self.results.len())
+            .filter(|&i| self.admits(&self.results[i]))
+            .collect();
+        let position = keep.and_then(|md5| {
+            self.visible
+                .iter()
+                .position(|&i| self.results[i].md5 == md5)
+        });
+        self.table.select(if self.visible.is_empty() {
+            None
+        } else {
+            Some(position.unwrap_or(0))
+        });
+        self.selection_moved();
+    }
+
+    /// The values one facet could take, most common first, each counted with
+    /// the *other* facet still applied — so the numbers say what picking that
+    /// value would actually leave on screen.
+    fn facet_options(&self, format: bool) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for book in &self.results {
+            let admitted = if format {
+                self.lang_admits(book)
+            } else {
+                self.fmt_admits(book)
+            };
+            if !admitted {
+                continue;
+            }
+            let value = if format {
+                book.ext().to_ascii_lowercase()
+            } else {
+                book.language.as_deref().unwrap_or("unknown").to_string()
+            };
+            match counts
+                .iter_mut()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&value))
+            {
+                Some((_, n)) => *n += 1,
+                None => counts.push((value, 1)),
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts
+    }
+
+    /// Step one facet through none → most common → … → back to none.
+    fn cycle_filter(&mut self, format: bool, step: isize) {
+        let options = self.facet_options(format);
+        if options.is_empty() {
+            return;
+        }
+        let current = if format {
+            self.fmt_filter.as_deref()
+        } else {
+            self.lang_filter.as_deref()
+        };
+        // Position 0 is "no filter"; the options follow in order.
+        let at = current
+            .and_then(|c| options.iter().position(|(n, _)| n.eq_ignore_ascii_case(c)))
+            .map(|i| i as isize + 1)
+            .unwrap_or(0);
+        let next = (at + step).rem_euclid(options.len() as isize + 1);
+        let value = (next > 0).then(|| options[next as usize - 1].0.clone());
+        if format {
+            self.fmt_filter = value;
+        } else {
+            self.lang_filter = value;
+        }
+        self.refine();
+    }
+
+    /// The count behind the active choice of one facet, for the filter bar.
+    fn facet_count(&self, format: bool) -> Option<usize> {
+        let current = if format {
+            self.fmt_filter.as_deref()?
+        } else {
+            self.lang_filter.as_deref()?
+        };
+        Some(
+            self.facet_options(format)
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(current))
+                .map(|(_, c)| *c)
+                .unwrap_or(0),
+        )
     }
 
     /// Note that the selection moved, so a cover becomes due shortly.
@@ -511,6 +683,12 @@ impl App {
     }
 
     /// Start a cover lookup once the selection has been still long enough.
+    ///
+    /// The two tabs source a cover differently: a search result has only its
+    /// MD5, so its cover comes off a mirror; a library book is a file on disk
+    /// that usually carries its own jacket, so that is read straight out of the
+    /// file with no network at all — falling back to the cache from a past
+    /// search when the file has none of its own.
     fn poll_cover(&mut self) {
         let Some(due) = self.cover_due else {
             return;
@@ -520,17 +698,28 @@ impl App {
         }
         self.cover_due = None;
 
-        let Some(md5) = self.selected().map(|b| b.md5.clone()) else {
+        let Some(md5) = self.focused_md5() else {
             return;
         };
-        if self.covers.contains_key(&md5) || self.mirrors.is_empty() {
+        if self.covers.contains_key(&md5) {
             return;
         }
 
+        match self.tab {
+            Tab::Search => self.spawn_search_cover(md5),
+            Tab::Library => self.spawn_library_cover(md5),
+        }
+    }
+
+    /// Fetch the highlighted search result's cover from a mirror.
+    fn spawn_search_cover(&mut self, md5: String) {
+        if self.mirrors.is_empty() {
+            return;
+        }
         let Some(book) = self.selected().cloned() else {
             return;
         };
-        self.covers.insert(md5.clone(), Slot::Looking);
+        self.covers.insert(md5, Slot::Looking);
 
         let tx = self.tx.clone();
         let settings = self.settings.clone();
@@ -553,9 +742,44 @@ impl App {
         });
     }
 
+    /// Read the highlighted library book's cover out of the file itself, or
+    /// the cache when the file carries none. No mirror is touched.
+    fn spawn_library_cover(&mut self, md5: String) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.covers.insert(md5.clone(), Slot::Looking);
+
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            // The file's own cover first; it is the book you actually have.
+            let found = entry
+                .present()
+                .then(|| crate::embedded::cover(&entry.path))
+                .flatten()
+                // Then a cover cached from a past search of the same book.
+                .or_else(|| cover::cached(&md5).flatten());
+            let _ = tx.send(Ev::Cover {
+                md5,
+                result: Ok(found),
+            });
+        });
+    }
+
+    /// The MD5 of whatever is highlighted on the current tab — a search result
+    /// or a library entry. Covers are keyed by it regardless of where the book
+    /// is being looked at, so a book downloaded and then found again in the
+    /// library reuses the cover already in hand.
+    fn focused_md5(&self) -> Option<String> {
+        match self.tab {
+            Tab::Search => self.selected().map(|b| b.md5.clone()),
+            Tab::Library => self.selected_entry().map(|e| e.md5.clone()),
+        }
+    }
+
     /// The cover to show right now, if there is one.
     fn current_art(&self) -> Option<&Art> {
-        match self.covers.get(&self.selected()?.md5) {
+        match self.covers.get(&self.focused_md5()?) {
             Some(Slot::Ready(art)) => Some(art),
             _ => None,
         }
@@ -564,11 +788,7 @@ impl App {
     /// Whether the detail pane should make room for a picture.
     fn cover_visible(&self) -> bool {
         self.protocol != Protocol::None
-            && self.tab == Tab::Search
-            && match self
-                .covers
-                .get(self.selected().map(|b| b.md5.as_str()).unwrap_or(""))
-            {
+            && match self.covers.get(self.focused_md5().as_deref().unwrap_or("")) {
                 // Space is reserved while looking too, so the pane does not
                 // jump about when the picture arrives.
                 Some(Slot::Looking) => true,
@@ -601,7 +821,7 @@ impl App {
         }
         let want = self
             .cover_rect()
-            .zip(self.selected().map(|b| b.md5.clone()))
+            .zip(self.focused_md5())
             .filter(|_| self.current_art().is_some())
             .map(|(rect, md5)| (md5, rect));
 
@@ -665,8 +885,10 @@ impl App {
             Tab::Library => {
                 // Downloads made elsewhere since we started belong here too.
                 self.reload_library();
-                // Whatever is painted belongs to the tab we are leaving.
+                // Whatever is painted belongs to the tab we are leaving; the
+                // library's own cover is then armed like any selection.
                 self.erase_cover();
+                self.selection_moved();
                 self.status = match self.library.len() {
                     0 => "nothing downloaded yet".into(),
                     1 => "1 book in the library".into(),
@@ -857,16 +1079,17 @@ impl App {
                 self.busy = false;
                 self.mirror_label = host;
                 self.marked = vec![false; books.len()];
-                self.status = if books.is_empty() {
-                    "nothing found — try fewer words".into()
-                } else {
-                    format!("{} result(s)", books.len())
-                };
-                self.table
-                    .select(if books.is_empty() { None } else { Some(0) });
+                self.table.select(None);
                 self.results = books;
+                self.refine();
+                self.status = match (self.results.len(), self.visible.len()) {
+                    (0, _) => "nothing found — try fewer words".into(),
+                    (total, shown) if shown < total => {
+                        format!("{shown} of {total} match the filters")
+                    }
+                    (total, _) => format!("{total} result(s)"),
+                };
                 self.mode = Mode::Browsing;
-                self.selection_moved();
             }
             Ev::Results(Err(e)) => {
                 self.busy = false;
@@ -1037,16 +1260,16 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::PageDown => self.move_by(10),
             KeyCode::PageUp => self.move_by(-10),
-            KeyCode::Home | KeyCode::Char('g') if !self.results.is_empty() => {
+            KeyCode::Home | KeyCode::Char('g') if !self.visible.is_empty() => {
                 self.table.select(Some(0));
                 self.selection_moved();
             }
-            KeyCode::End | KeyCode::Char('G') if !self.results.is_empty() => {
-                self.table.select(Some(self.results.len() - 1));
+            KeyCode::End | KeyCode::Char('G') if !self.visible.is_empty() => {
+                self.table.select(Some(self.visible.len() - 1));
                 self.selection_moved();
             }
             KeyCode::Char(' ') => {
-                if let Some(i) = self.table.selected()
+                if let Some(&i) = self.table.selected().and_then(|i| self.visible.get(i))
                     && let Some(flag) = self.marked.get_mut(i)
                 {
                     *flag = !*flag;
@@ -1054,8 +1277,26 @@ impl App {
                 self.move_by(1);
             }
             KeyCode::Char('a') => {
-                let all = self.marked.iter().all(|m| *m);
-                self.marked.iter_mut().for_each(|m| *m = !all);
+                // "Everything" means everything showing: filters carve the
+                // batch too, which is the whole point of them.
+                let all = self
+                    .visible
+                    .iter()
+                    .all(|&i| self.marked.get(i).copied().unwrap_or(false));
+                for &i in &self.visible {
+                    if let Some(flag) = self.marked.get_mut(i) {
+                        *flag = !all;
+                    }
+                }
+            }
+            KeyCode::Char('e') => self.cycle_filter(true, 1),
+            KeyCode::Char('E') => self.cycle_filter(true, -1),
+            KeyCode::Char('l') => self.cycle_filter(false, 1),
+            KeyCode::Char('L') => self.cycle_filter(false, -1),
+            KeyCode::Char('x') if self.fmt_filter.is_some() || self.lang_filter.is_some() => {
+                self.fmt_filter = None;
+                self.lang_filter = None;
+                self.refine();
             }
             KeyCode::Enter => self.spawn_downloads(),
             KeyCode::Char('r') => self.spawn_search(),
@@ -1082,9 +1323,11 @@ impl App {
             KeyCode::PageUp => self.move_library_by(-10),
             KeyCode::Home | KeyCode::Char('g') if !self.shown.is_empty() => {
                 self.library_table.select(Some(0));
+                self.selection_moved();
             }
             KeyCode::End | KeyCode::Char('G') if !self.shown.is_empty() => {
                 self.library_table.select(Some(self.shown.len() - 1));
+                self.selection_moved();
             }
             KeyCode::Enter | KeyCode::Char('o') => self.launch_selected(false),
             KeyCode::Char('f') => self.launch_selected(true),
@@ -1103,15 +1346,18 @@ impl App {
         }
         let last = self.shown.len() - 1;
         let current = self.library_table.selected().unwrap_or(0) as isize;
-        self.library_table
-            .select(Some((current + delta).clamp(0, last as isize) as usize));
+        let next = (current + delta).clamp(0, last as isize) as usize;
+        if Some(next) != self.library_table.selected() {
+            self.selection_moved();
+        }
+        self.library_table.select(Some(next));
     }
 
     fn move_by(&mut self, delta: isize) {
-        if self.results.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        let last = self.results.len() - 1;
+        let last = self.visible.len() - 1;
         let current = self.table.selected().unwrap_or(0) as isize;
         let next = (current + delta).clamp(0, last as isize) as usize;
         if Some(next) != self.table.selected() {
@@ -1168,33 +1414,147 @@ impl App {
         self.cover_area
     }
 
+    /// Whether the list earns its tall side panel: enough columns for the rows
+    /// to keep breathing next to a poster-sized cover, and something to show.
+    fn side_panel(&self, area: Rect) -> bool {
+        if area.width < 110 {
+            return false;
+        }
+        match self.tab {
+            Tab::Search => !self.results.is_empty(),
+            Tab::Library => !self.shown.is_empty(),
+        }
+    }
+
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let details = self.details_height(area);
+        // The canvas goes down first; everything after patches colour onto it.
+        frame.render_widget(
+            Block::new().style(Style::new().bg(theme::BG).fg(theme::TEXT)),
+            area,
+        );
+        self.cover_area = None;
+
+        let side = self.side_panel(area);
+        let filter_bar = (self.tab == Tab::Search && !self.results.is_empty()) as u16;
+        // No strip when there is nothing to describe — a bordered box holding
+        // "no selection" is furniture, not information. Errors still earn it.
+        let empty_tab = match self.tab {
+            Tab::Search => self.results.is_empty(),
+            Tab::Library => self.shown.is_empty(),
+        };
+        let details = if side || (empty_tab && self.error.is_none()) {
+            0
+        } else {
+            self.details_height(area)
+        };
         let chunks = Layout::vertical([
-            Constraint::Length(3),       // search box
-            Constraint::Min(3),          // results
-            Constraint::Length(details), // details
-            Constraint::Length(1),       // key hints
+            Constraint::Length(3),          // search box
+            Constraint::Length(filter_bar), // the two facets, when there are results
+            Constraint::Min(3),             // results
+            Constraint::Length(details),    // details strip (narrow layout)
+            Constraint::Length(1),          // key hints
         ])
         .split(area);
 
         self.render_input(frame, chunks[0]);
+        if filter_bar == 1 {
+            self.render_filters(frame, chunks[1]);
+        }
         match self.tab {
+            _ if side => {
+                let columns =
+                    Layout::horizontal([Constraint::Min(40), Constraint::Length(42)])
+                        .split(chunks[2]);
+                match self.tab {
+                    Tab::Search => {
+                        self.render_results(frame, columns[0]);
+                        self.render_side_details(frame, columns[1]);
+                    }
+                    Tab::Library => {
+                        self.render_library(frame, columns[0]);
+                        self.render_library_side_details(frame, columns[1]);
+                    }
+                }
+            }
             Tab::Search => {
-                self.render_results(frame, chunks[1]);
-                self.render_details(frame, chunks[2]);
+                self.render_results(frame, chunks[2]);
+                self.render_details(frame, chunks[3]);
             }
             Tab::Library => {
-                self.render_library(frame, chunks[1]);
-                self.render_library_details(frame, chunks[2]);
+                self.render_library(frame, chunks[2]);
+                self.render_library_details(frame, chunks[3]);
             }
         }
-        self.render_hints(frame, chunks[3]);
+        self.render_hints(frame, chunks[4]);
 
         if self.mode == Mode::Help {
             self.render_help(frame);
         }
+    }
+
+    /// The refinement bar: the two facets and what they leave showing.
+    ///
+    /// It lives on its own row, under the search box, so the counts update in
+    /// place as `e` and `l` cycle — filters you can watch working, rather than
+    /// tags you have to re-type into a new search.
+    fn render_filters(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let filtered = self.fmt_filter.is_some() || self.lang_filter.is_some();
+
+        // Right side first: how much of the catch is on screen. The amber only
+        // comes out when a filter is actually hiding something.
+        let counter = if self.visible.len() < self.results.len() {
+            Span::styled(
+                format!("{} of {} shown ", self.visible.len(), self.results.len()),
+                Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!("{} results ", self.results.len()), theme::faint())
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(counter)).alignment(Alignment::Right),
+            area,
+        );
+
+        let key = |k: &str| {
+            Span::styled(k.to_string(), theme::accent().add_modifier(Modifier::BOLD))
+        };
+        let label = |l: &str| Span::styled(format!(" {l} "), theme::faint());
+
+        let mut spans = vec![Span::raw(" "), key("e"), label("format")];
+        match &self.fmt_filter {
+            Some(f) => {
+                spans.push(Span::styled(format!(" {f} "), theme::format_chip(f)));
+                if let Some(n) = self.facet_count(true) {
+                    spans.push(Span::styled(format!(" {n}"), theme::faint()));
+                }
+            }
+            None => spans.push(Span::styled("all", theme::muted())),
+        }
+        spans.push(Span::raw("    "));
+        spans.push(key("l"));
+        spans.push(label("language"));
+        match &self.lang_filter {
+            Some(l) => {
+                spans.push(Span::styled(
+                    l.clone(),
+                    Style::new().fg(theme::LANG).add_modifier(Modifier::BOLD),
+                ));
+                if let Some(n) = self.facet_count(false) {
+                    spans.push(Span::styled(format!(" {n}"), theme::faint()));
+                }
+            }
+            None => spans.push(Span::styled("all", theme::muted())),
+        }
+        if filtered {
+            spans.push(Span::raw("    "));
+            spans.push(key("x"));
+            spans.push(label("clear"));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// The tab bar and the text box under it.
@@ -1295,7 +1655,7 @@ impl App {
     }
 
     fn render_results(&mut self, frame: &mut Frame, area: Rect) {
-        if self.results.is_empty() {
+        if self.visible.is_empty() {
             self.render_empty(frame, area);
             return;
         }
@@ -1305,7 +1665,7 @@ impl App {
             Cell::from("TITLE"),
             Cell::from("AUTHOR"),
             Cell::from("YEAR"),
-            Cell::from("LANG"),
+            Cell::from("LANGUAGE"),
             Cell::from("SIZE"),
             Cell::from("FMT"),
             Cell::from("STATUS"),
@@ -1315,10 +1675,11 @@ impl App {
 
         let selected = self.table.selected();
         let rows: Vec<Row> = self
-            .results
+            .visible
             .iter()
             .enumerate()
-            .map(|(i, book)| {
+            .filter_map(|(row, &i)| self.results.get(i).map(|b| (row, i, b)))
+            .map(|(row, i, book)| {
                 let marked = self.marked.get(i).copied().unwrap_or(false);
                 let job = self.jobs.get(&book.md5);
                 let (marker, marker_style) = match job {
@@ -1336,12 +1697,21 @@ impl App {
                     all.split(';').next().unwrap_or(all).trim().to_string()
                 };
 
-                // The highlighted title turns full-white and bold; the rest sit
-                // one step down so the cursor row plainly leads.
-                let title_style = if Some(i) == selected {
+                // The highlighted title goes bold; every title stays at full
+                // strength, because the titles are what the screen is for.
+                let title_style = if Some(row) == selected {
                     theme::text().add_modifier(Modifier::BOLD)
                 } else {
-                    theme::muted()
+                    theme::text()
+                };
+                // The selection wash replaces every background, so the chip
+                // trades its solid for the same hue as bold text there.
+                let chip = if Some(row) == selected {
+                    Style::new()
+                        .fg(theme::format_color(book.ext()))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    theme::format_chip(book.ext())
                 };
 
                 Row::new([
@@ -1349,11 +1719,19 @@ impl App {
                     Cell::from(book.title.clone()).style(title_style),
                     Cell::from(author).style(theme::muted()),
                     Cell::from(book.year.clone().unwrap_or_default()).style(theme::faint()),
-                    Cell::from(book.language.clone().unwrap_or_default()).style(theme::faint()),
+                    Cell::from(book.language.clone().unwrap_or_default())
+                        .style(Style::new().fg(theme::LANG)),
                     Cell::from(book.size_human()).style(theme::faint()),
-                    Cell::from(book.ext().to_string()).style(Style::new().fg(theme::AMBER)),
+                    Cell::from(format!(" {} ", book.ext())).style(chip),
                     Cell::from(job_label(job)).style(job_style(job)),
                 ])
+                // The zebra: alternate rows sit one step off the canvas, so a
+                // wide row can be followed without a ruler.
+                .style(Style::new().bg(if row % 2 == 1 {
+                    theme::BG_ALT
+                } else {
+                    theme::BG
+                }))
             })
             .collect();
 
@@ -1361,19 +1739,24 @@ impl App {
             rows,
             [
                 Constraint::Length(1),
-                Constraint::Fill(3),
+                // Titles carry the information; authors repeat. Weight the
+                // room accordingly.
+                Constraint::Fill(5),
                 Constraint::Fill(2),
                 Constraint::Length(4),
+                Constraint::Length(10),
                 Constraint::Length(8),
-                Constraint::Length(9),
-                Constraint::Length(5),
-                Constraint::Length(11),
+                Constraint::Length(6),
+                Constraint::Length(7),
             ],
         )
         .header(header)
         .column_spacing(1)
         .row_highlight_style(theme::selected_row())
-        .highlight_symbol(theme::CURSOR);
+        .highlight_symbol(Span::styled(
+            theme::CURSOR,
+            theme::accent().add_modifier(Modifier::BOLD),
+        ));
 
         frame.render_stateful_widget(table, area, &mut self.table);
     }
@@ -1382,16 +1765,52 @@ impl App {
     /// mirror is up, a few words on how to begin. Centred rather than tucked in
     /// a corner, so an empty screen still looks composed.
     fn render_empty(&self, frame: &mut Frame, area: Rect) {
+        // Results exist but the filters admit none of them — say which lever
+        // to pull, not just "nothing here".
+        if !self.results.is_empty() {
+            let mut carved = Vec::new();
+            if let Some(f) = &self.fmt_filter {
+                carved.push(f.clone());
+            }
+            if let Some(l) = &self.lang_filter {
+                carved.push(l.clone());
+            }
+            let lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "none of the {} results are {}",
+                        self.results.len(),
+                        carved.join(" + ")
+                    ),
+                    theme::muted(),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("x", theme::accent().add_modifier(Modifier::BOLD)),
+                    Span::styled(" clears the filters   ", theme::faint()),
+                    Span::styled("e l", theme::accent().add_modifier(Modifier::BOLD)),
+                    Span::styled(" cycle them", theme::faint()),
+                ]),
+            ];
+            let block = area.inner(Margin {
+                horizontal: 2,
+                vertical: area.height.saturating_sub(lines.len() as u16) / 2,
+            });
+            frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), block);
+            return;
+        }
+
         let mut lines = vec![Line::from(Span::styled(
             self.status.clone() + if self.busy { "…" } else { "" },
             theme::muted(),
         ))];
         if !self.busy && self.results.is_empty() && self.mode != Mode::Editing {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "press / and type a title or author",
-                theme::faint(),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("press ", theme::faint()),
+                Span::styled("/", theme::accent().add_modifier(Modifier::BOLD)),
+                Span::styled(" and type a title or author", theme::faint()),
+            ]));
         }
         let block = area.inner(Margin {
             horizontal: 2,
@@ -1433,7 +1852,7 @@ impl App {
             whole
         };
 
-        let Some(book) = self.table.selected().and_then(|i| self.results.get(i)) else {
+        let Some(book) = self.selected().cloned() else {
             let hint = self
                 .error
                 .clone()
@@ -1519,6 +1938,165 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
+    /// The tall right-hand panel of the wide layout: the cover at something
+    /// like poster size, then the record beneath it as labelled rows — a
+    /// jacket flap rather than a footnote.
+    fn render_side_details(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(theme::FAINT));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 10 || inner.height < 6 {
+            return;
+        }
+
+        let Some(book) = self.selected().cloned() else {
+            let hint = self
+                .error
+                .clone()
+                .unwrap_or_else(|| "no selection".to_string());
+            let style = if self.error.is_some() {
+                Style::new().fg(theme::DANGER)
+            } else {
+                theme::faint()
+            };
+            frame.render_widget(
+                Paragraph::new(hint)
+                    .style(style)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true }),
+                inner.inner(Margin {
+                    horizontal: 1,
+                    vertical: inner.height / 2,
+                }),
+            );
+            return;
+        };
+
+        let text_top = self.place_cover(frame, inner, &book.md5);
+
+        let body = Rect {
+            x: inner.x + 1,
+            y: text_top,
+            width: inner.width.saturating_sub(2),
+            height: inner.bottom().saturating_sub(text_top),
+        };
+        if body.height == 0 {
+            return;
+        }
+
+        let fact = |label: &str, value: Span<'static>| {
+            Line::from(vec![
+                Span::styled(format!("{label:<10}"), theme::faint()),
+                value,
+            ])
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                book.title.clone(),
+                theme::text().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                book.authors_or_unknown().to_string(),
+                theme::muted(),
+            )),
+            Line::from(""),
+        ];
+        if let Some(p) = book.publisher.as_deref().filter(|s| !s.is_empty()) {
+            lines.push(fact("publisher", Span::styled(p.to_string(), theme::muted())));
+        }
+        if let Some(y) = book.year.as_deref().filter(|s| !s.is_empty()) {
+            lines.push(fact("year", Span::styled(y.to_string(), theme::muted())));
+        }
+        if let Some(l) = book.language.as_deref().filter(|s| !s.is_empty()) {
+            lines.push(fact(
+                "language",
+                Span::styled(l.to_string(), Style::new().fg(theme::LANG)),
+            ));
+        }
+        if let Some(p) = book.pages.as_deref().filter(|s| !s.is_empty() && *s != "0") {
+            lines.push(fact("pages", Span::styled(p.to_string(), theme::muted())));
+        }
+        if !book.size_human().is_empty() {
+            lines.push(fact("size", Span::styled(book.size_human(), theme::muted())));
+        }
+        lines.push(fact(
+            "format",
+            Span::styled(format!(" {} ", book.ext()), theme::format_chip(book.ext())),
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(book.md5.clone(), theme::faint())));
+        lines.push(Line::from(""));
+
+        // The most urgent thing about the selection last, where the eye rests:
+        // an error, else this file's download state.
+        if let Some(error) = &self.error {
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::new().fg(theme::DANGER),
+            )));
+        } else {
+            match self.jobs.get(&book.md5) {
+                Some(Job::Saved(name)) => lines.push(Line::from(Span::styled(
+                    format!("✓ saved as {name}"),
+                    Style::new().fg(theme::SUCCESS),
+                ))),
+                Some(Job::Failed(e)) => lines.push(Line::from(Span::styled(
+                    format!("✗ {e}"),
+                    Style::new().fg(theme::DANGER),
+                ))),
+                Some(Job::Running { done, total }) => lines.push(Line::from(Span::styled(
+                    progress_bar(*done, *total, (body.width as usize).saturating_sub(16)),
+                    Style::new().fg(theme::ACCENT),
+                ))),
+                Some(Job::Queued) => {
+                    lines.push(Line::from(Span::styled("queued", theme::faint())))
+                }
+                None => lines.push(Line::from(vec![
+                    Span::styled("⏎ download → ", theme::accent()),
+                    Span::styled(self.settings.dest_dir.display().to_string(), theme::faint()),
+                ])),
+            }
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
+    }
+
+    /// Place the cover for `md5` across the top of `inner`, and return the row
+    /// where the text beneath it should begin. Sized to the picture's own shape
+    /// once that is known and to a 2:3 jacket until then, centred, and capped
+    /// so the record below always keeps its ten lines. A book with no cover
+    /// gets a quiet empty jacket so the panel does not jump when one arrives.
+    fn place_cover(&mut self, frame: &mut Frame, inner: Rect, md5: &str) -> u16 {
+        if self.protocol == Protocol::None {
+            return inner.y;
+        }
+        let (art_w, art_h) = match self.covers.get(md5) {
+            Some(Slot::Ready(art)) => art
+                .pixels
+                .as_ref()
+                .map(|p| (p.width.max(1) as u32, p.height.max(1) as u32))
+                .unwrap_or((2, 3)),
+            _ => (2, 3),
+        };
+        let max_height = inner.height.saturating_sub(11).clamp(6, 21);
+        let max_width = inner.width.saturating_sub(2);
+        let width = max_width.min((max_height as u32 * 2 * art_w / art_h) as u16);
+        let height = ((width as u32 * art_h).div_ceil(art_w * 2) as u16).min(max_height);
+        let rect = Rect {
+            x: inner.x + (inner.width - width) / 2,
+            y: inner.y,
+            width,
+            height,
+        };
+        match self.covers.get(md5) {
+            Some(Slot::Ready(_)) | Some(Slot::Looking) => self.render_cover(frame, rect),
+            _ => render_cover_placeholder(frame, rect),
+        }
+        rect.bottom() + 1
+    }
+
     /// Draw the cover, or reserve the space it is about to occupy.
     ///
     /// For the two pixel protocols this only records where the picture goes;
@@ -1531,10 +2109,7 @@ impl App {
         }
         self.cover_area = Some(area);
 
-        match self
-            .covers
-            .get(self.selected().map(|b| b.md5.as_str()).unwrap_or(""))
-        {
+        match self.covers.get(self.focused_md5().as_deref().unwrap_or("")) {
             Some(Slot::Looking) => {
                 frame.render_widget(
                     Paragraph::new("…")
@@ -1604,7 +2179,7 @@ impl App {
                 // A present book leads with a small dot; a missing one with a
                 // warning, and everything about its row reads as unavailable.
                 let (marker, marker_style) = if present {
-                    ("•", theme::faint())
+                    ("•", Style::new().fg(theme::SUCCESS))
                 } else {
                     ("!", Style::new().fg(theme::DANGER))
                 };
@@ -1621,18 +2196,29 @@ impl App {
                     format!("{} (missing)", entry.title)
                 };
 
+                let chip = if !present {
+                    theme::faint()
+                } else if here {
+                    Style::new()
+                        .fg(theme::format_color(entry.ext()))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    theme::format_chip(entry.ext())
+                };
+
                 Row::new([
                     Cell::from(marker).style(marker_style),
                     Cell::from(title).style(title_style),
                     Cell::from(entry.first_author()).style(theme::muted()),
-                    Cell::from(history::when(entry.at, now)).style(theme::faint()),
+                    Cell::from(history::when(entry.at, now)).style(theme::muted()),
                     Cell::from(human_bytes(entry.size)).style(theme::faint()),
-                    Cell::from(entry.ext().to_string()).style(if present {
-                        Style::new().fg(theme::AMBER)
-                    } else {
-                        theme::faint()
-                    }),
+                    Cell::from(format!(" {} ", entry.ext())).style(chip),
                 ])
+                .style(Style::new().bg(if row % 2 == 1 {
+                    theme::BG_ALT
+                } else {
+                    theme::BG
+                }))
             })
             .collect();
 
@@ -1640,17 +2226,20 @@ impl App {
             rows,
             [
                 Constraint::Length(1),
-                Constraint::Fill(3),
+                Constraint::Fill(5),
                 Constraint::Fill(2),
                 Constraint::Length(12),
                 Constraint::Length(9),
-                Constraint::Length(5),
+                Constraint::Length(6),
             ],
         )
         .header(header)
         .column_spacing(1)
         .row_highlight_style(theme::selected_row())
-        .highlight_symbol(theme::CURSOR);
+        .highlight_symbol(Span::styled(
+            theme::CURSOR,
+            theme::accent().add_modifier(Modifier::BOLD),
+        ));
 
         frame.render_stateful_widget(table, area, &mut self.library_table);
     }
@@ -1700,12 +2289,35 @@ impl App {
     }
 
     /// Where the highlighted book went, and whether it is still there.
-    fn render_library_details(&self, frame: &mut Frame, area: Rect) {
+    fn render_library_details(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(theme::FAINT));
-        let inner = block.inner(area);
+        let whole = block.inner(area);
         frame.render_widget(block, area);
+
+        // A cover column on the left when the book has one to show, exactly as
+        // the search detail strip does — the library reads its cover out of the
+        // file rather than off a mirror, but the layout is the same.
+        self.cover_area = None;
+        let inner = if self.cover_visible() && whole.width > 30 {
+            let width = ((whole.height as u32 * 2 * 2 / 3) as u16).clamp(6, 16);
+            let picture = Rect {
+                x: whole.x,
+                y: whole.y,
+                width,
+                height: whole.height,
+            };
+            self.render_cover(frame, picture);
+            Rect {
+                x: whole.x + width + 2,
+                y: whole.y,
+                width: whole.width.saturating_sub(width + 2),
+                height: whole.height,
+            }
+        } else {
+            whole
+        };
 
         let Some(entry) = self.selected_entry() else {
             let hint = self
@@ -1741,11 +2353,12 @@ impl App {
             )),
             Line::from(Span::styled(entry.path.display().to_string(), theme::faint())),
             Line::from(vec![
+                Span::styled(format!(" {} ", entry.ext()), theme::format_chip(entry.ext())),
                 Span::styled(
                     format!(
-                        "{}  ·  {}  ·  ",
-                        history::timestamp(entry.at),
+                        "  {}  ·  {}  ·  ",
                         human_bytes(entry.size),
+                        history::timestamp(entry.at),
                     ),
                     theme::muted(),
                 ),
@@ -1774,6 +2387,93 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
+    /// The wide library panel: the book's own cover near poster size, then
+    /// where the file is and what is known about it — the same jacket-flap
+    /// layout the search tab uses, sourced from the file instead of a mirror.
+    fn render_library_side_details(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(theme::FAINT));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 10 || inner.height < 6 {
+            return;
+        }
+
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+
+        let text_top = self.place_cover(frame, inner, &entry.md5);
+        let body = Rect {
+            x: inner.x + 1,
+            y: text_top,
+            width: inner.width.saturating_sub(2),
+            height: inner.bottom().saturating_sub(text_top),
+        };
+        if body.height == 0 {
+            return;
+        }
+
+        let fact = |label: &str, value: Span<'static>| {
+            Line::from(vec![
+                Span::styled(format!("{label:<9}"), theme::faint()),
+                value,
+            ])
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                entry.title.clone(),
+                theme::text().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                entry.authors.clone().unwrap_or_default(),
+                theme::muted(),
+            )),
+            Line::from(""),
+            fact(
+                "format",
+                Span::styled(format!(" {} ", entry.ext()), theme::format_chip(entry.ext())),
+            ),
+            fact("size", Span::styled(human_bytes(entry.size), theme::muted())),
+            fact(
+                "added",
+                Span::styled(history::timestamp(entry.at), theme::muted()),
+            ),
+            fact(
+                "checksum",
+                if entry.verified {
+                    Span::styled("✓ MD5 verified", Style::new().fg(theme::SUCCESS))
+                } else {
+                    Span::styled("unverified", theme::faint())
+                },
+            ),
+            Line::from(""),
+            Line::from(Span::styled("saved to", theme::faint())),
+            Line::from(Span::styled(entry.path.display().to_string(), theme::faint())),
+            Line::from(""),
+        ];
+
+        if let Some(error) = &self.error {
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::new().fg(theme::DANGER),
+            )));
+        } else if !entry.present() {
+            lines.push(Line::from(Span::styled(
+                "⚠ the file is no longer there — d to forget it",
+                Style::new().fg(theme::DANGER),
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("⏎ open", theme::accent()),
+                Span::styled("    f reveal", theme::faint()),
+            ]));
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
+    }
+
     fn render_hints(&self, frame: &mut Frame, area: Rect) {
         // Each hint is a (key, label) pair; the key rides in the accent, the
         // label sits faint beneath it, so the bar reads as a legend rather than
@@ -1799,7 +2499,8 @@ impl App {
                 ("↑↓", "move"),
                 ("space", "mark"),
                 ("⏎", "download"),
-                ("o", "open"),
+                ("e", "format"),
+                ("l", "language"),
                 ("/", "search"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1853,8 +2554,11 @@ impl App {
                 "search tab",
                 &[
                     ("⏎", "run the search, or download the selection"),
+                    ("e  E", "cycle the format filter, e.g. epub only"),
+                    ("l  L", "cycle the language filter"),
+                    ("x", "clear both filters"),
                     ("space", "mark a result for batch download"),
-                    ("a", "mark or unmark everything"),
+                    ("a", "mark or unmark everything showing"),
                     ("o  f", "open a downloaded result / reveal it"),
                     ("r", "run the search again"),
                     ("m", "re-probe mirrors and pick a new one"),
@@ -1915,6 +2619,9 @@ impl App {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(theme::ACCENT))
+            // One step off the canvas, so the overlay reads as a raised
+            // surface rather than a hole cut in the screen.
+            .style(Style::new().bg(theme::BG_ALT))
             .title(Span::styled(
                 " clibgen · keys ",
                 Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
@@ -1922,6 +2629,29 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+/// Where a cover would go when the book has none: a quiet empty jacket, so the
+/// panel keeps its shape instead of jumping when a picture does arrive.
+fn render_cover_placeholder(frame: &mut Frame, area: Rect) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::FAINT));
+    frame.render_widget(&block, area);
+    if area.height >= 3 {
+        let middle = Rect {
+            x: area.x,
+            y: area.y + area.height / 2,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new("no cover")
+                .style(theme::faint())
+                .alignment(Alignment::Center),
+            middle,
+        );
     }
 }
 
@@ -2016,6 +2746,9 @@ mod tests {
             filter: String::new(),
             caret: 0,
             results: Vec::new(),
+            visible: Vec::new(),
+            fmt_filter: None,
+            lang_filter: None,
             table: TableState::default(),
             marked: Vec::new(),
             jobs: HashMap::new(),
@@ -2053,6 +2786,15 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    /// Put results in place the way `Ev::Results` would, so the visible-index
+    /// mapping is always consistent with what the table believes.
+    fn install(a: &mut App, list: Vec<Book>) {
+        a.marked = vec![false; list.len()];
+        a.results = list;
+        a.table.select(None);
+        a.refine();
     }
 
     #[test]
@@ -2119,9 +2861,7 @@ mod tests {
     fn navigation_stays_in_bounds() {
         let mut a = app();
         a.mode = Mode::Browsing;
-        a.results = books(3);
-        a.marked = vec![false; 3];
-        a.table.select(Some(0));
+        install(&mut a, books(3));
 
         press(&mut a, KeyCode::Up); // already at the top
         assert_eq!(a.table.selected(), Some(0));
@@ -2150,9 +2890,7 @@ mod tests {
     fn space_marks_and_advances() {
         let mut a = app();
         a.mode = Mode::Browsing;
-        a.results = books(3);
-        a.marked = vec![false; 3];
-        a.table.select(Some(0));
+        install(&mut a, books(3));
 
         press(&mut a, KeyCode::Char(' '));
         assert_eq!(a.marked, [true, false, false]);
@@ -2167,8 +2905,7 @@ mod tests {
     fn a_toggles_every_mark() {
         let mut a = app();
         a.mode = Mode::Browsing;
-        a.results = books(3);
-        a.marked = vec![false; 3];
+        install(&mut a, books(3));
         press(&mut a, KeyCode::Char('a'));
         assert_eq!(a.marked, [true, true, true]);
         press(&mut a, KeyCode::Char('a'));
@@ -2303,18 +3040,19 @@ mod tests {
         let mut a = app();
         a.mode = Mode::Browsing;
         a.mirror_label = "libgen.li".into();
-        a.results = vec![Book {
-            md5: "1b9159991f7fb1b3910c0be9ebf7e595".into(),
-            title: "The Rust Programming Language".into(),
-            authors: Some("Klabnik, Steve;Nichols, Carol".into()),
-            year: Some("2019".into()),
-            language: Some("English".into()),
-            extension: Some("epub".into()),
-            size_bytes: Some(3 * 1024 * 1024),
-            ..Default::default()
-        }];
-        a.marked = vec![false];
-        a.table.select(Some(0));
+        install(
+            &mut a,
+            vec![Book {
+                md5: "1b9159991f7fb1b3910c0be9ebf7e595".into(),
+                title: "The Rust Programming Language".into(),
+                authors: Some("Klabnik, Steve;Nichols, Carol".into()),
+                year: Some("2019".into()),
+                language: Some("English".into()),
+                extension: Some("epub".into()),
+                size_bytes: Some(3 * 1024 * 1024),
+                ..Default::default()
+            }],
+        );
 
         let screen = draw(&mut a, 100, 24);
         assert!(screen.contains("SEARCH"), "tab bar missing: {screen}");
@@ -2337,8 +3075,7 @@ mod tests {
         for (w, h) in [(20u16, 8u16), (40, 10), (80, 24), (200, 60), (250, 12)] {
             let mut a = app();
             a.mode = Mode::Browsing;
-            a.results = books(30);
-            a.marked = vec![false; 30];
+            install(&mut a, books(30));
             a.table.select(Some(29));
             let _ = draw(&mut a, w, h);
 
@@ -2374,9 +3111,7 @@ mod tests {
     fn download_state_is_visible_in_the_row_and_detail() {
         let mut a = app();
         a.mode = Mode::Browsing;
-        a.results = books(1);
-        a.marked = vec![false];
-        a.table.select(Some(0));
+        install(&mut a, books(1));
         a.jobs.insert(
             a.results[0].md5.clone(),
             Job::Running {
@@ -2421,6 +3156,71 @@ mod tests {
         a.mode = Mode::Browsing;
         a.library = entries;
         a.refilter();
+    }
+
+    #[test]
+    fn moving_in_the_library_arms_a_cover_lookup() {
+        let mut a = app();
+        a.protocol = Protocol::Blocks;
+        with_library(&mut a, entries(3));
+        a.cover_due = None;
+        press(&mut a, KeyCode::Down);
+        assert!(
+            a.cover_due.is_some(),
+            "a settled library selection is worth a cover, just like search"
+        );
+    }
+
+    #[test]
+    fn a_library_book_shows_its_cover_in_both_layouts() {
+        let mut a = app();
+        a.protocol = Protocol::Blocks;
+        with_library(&mut a, entries(3));
+        a.library_table.select(Some(0));
+
+        // Stand in for a cover pulled out of the file on disk.
+        let image = crate::jpeg::decode(include_bytes!("../tests/fixtures/cover.jpg")).unwrap();
+        let md5 = a.selected_entry().unwrap().md5.clone();
+        a.covers.insert(
+            md5,
+            Slot::Ready(Box::new(Art {
+                encoded: Vec::new(),
+                pixels: Some(image),
+            })),
+        );
+
+        // Wide: the poster panel, with the cover and the file facts beside it.
+        let wide = draw(&mut a, 130, 40);
+        assert!(
+            wide.contains(graphics::UPPER_HALF),
+            "the library cover should draw as half blocks: {wide}"
+        );
+        assert!(wide.contains("Book 0"), "{wide}");
+        assert!(wide.contains("saved to"), "{wide}");
+
+        // Narrow: the bottom strip grows a cover column too.
+        let narrow = draw(&mut a, 90, 24);
+        assert!(
+            narrow.contains(graphics::UPPER_HALF),
+            "the narrow strip should still show the cover: {narrow}"
+        );
+    }
+
+    #[test]
+    fn the_library_reuses_a_cover_across_tabs_by_md5() {
+        // A cover fetched while searching is keyed by MD5; the same book in the
+        // library must find it under the same key rather than looking again.
+        let mut a = app();
+        a.protocol = Protocol::Blocks;
+        let md5 = format!("{:032x}", 0);
+        a.covers.insert(md5.clone(), Slot::Nothing);
+        with_library(&mut a, entries(1));
+        a.library_table.select(Some(0));
+        assert_eq!(a.selected_entry().unwrap().md5, md5);
+        // Already known, so a poll starts no new lookup and leaves it be.
+        a.cover_due = Some(Instant::now());
+        a.poll_cover();
+        assert!(matches!(a.covers.get(&md5), Some(Slot::Nothing)));
     }
 
     #[test]
@@ -2551,9 +3351,7 @@ mod tests {
     fn opening_a_result_that_was_never_downloaded_says_so() {
         let mut a = app();
         a.mode = Mode::Browsing;
-        a.results = books(1);
-        a.marked = vec![false];
-        a.table.select(Some(0));
+        install(&mut a, books(1));
         press(&mut a, KeyCode::Char('o'));
         assert_eq!(
             a.error.as_deref(),
@@ -2578,9 +3376,7 @@ mod tests {
         let mut a = app();
         a.mode = Mode::Browsing;
         a.protocol = Protocol::Blocks;
-        a.results = books(1);
-        a.marked = vec![false];
-        a.table.select(Some(0));
+        install(&mut a, books(1));
 
         let image = crate::jpeg::decode(include_bytes!("../tests/fixtures/cover.jpg")).unwrap();
         a.covers.insert(
@@ -2607,9 +3403,7 @@ mod tests {
         let mut a = app();
         a.mode = Mode::Browsing;
         a.protocol = Protocol::Kitty;
-        a.results = books(2);
-        a.marked = vec![false; 2];
-        a.table.select(Some(0));
+        install(&mut a, books(2));
 
         let image = crate::jpeg::decode(include_bytes!("../tests/fixtures/cover.jpg")).unwrap();
         a.covers.insert(
@@ -2650,9 +3444,7 @@ mod tests {
         let mut a = app();
         a.mode = Mode::Browsing;
         a.protocol = Protocol::Blocks;
-        a.results = books(20);
-        a.marked = vec![false; 20];
-        a.table.select(Some(0));
+        install(&mut a, books(20));
         a.covers.insert(a.results[0].md5.clone(), Slot::Looking);
 
         for (w, h) in [(20u16, 8u16), (40, 10), (80, 24), (200, 60)] {
@@ -2676,9 +3468,7 @@ mod tests {
         let mut a = app();
         a.protocol = Protocol::Blocks;
         a.mode = Mode::Browsing;
-        a.results = books(3);
-        a.marked = vec![false; 3];
-        a.table.select(Some(0));
+        install(&mut a, books(3));
 
         press(&mut a, KeyCode::Down);
         assert!(a.cover_due.is_some(), "moving should arm the lookup");
@@ -2696,9 +3486,7 @@ mod tests {
     fn a_terminal_without_graphics_never_reserves_cover_space() {
         let mut a = app();
         a.mode = Mode::Browsing;
-        a.results = books(1);
-        a.marked = vec![false];
-        a.table.select(Some(0));
+        install(&mut a, books(1));
         a.covers.insert(
             a.results[0].md5.clone(),
             Slot::Ready(Box::new(Art {
@@ -2709,6 +3497,421 @@ mod tests {
         assert!(!a.cover_visible());
         press(&mut a, KeyCode::Down);
         assert!(a.cover_due.is_none(), "no protocol, no lookups");
+    }
+
+    /// A result set shaped like the Das Kapital problem: one work, many
+    /// languages and formats mixed together.
+    fn polyglot() -> Vec<Book> {
+        let entry = |i: usize, lang: &str, ext: &str| Book {
+            md5: format!("{i:032x}"),
+            title: format!("Das Kapital {i}"),
+            language: Some(lang.into()),
+            extension: Some(ext.into()),
+            ..Default::default()
+        };
+        vec![
+            entry(0, "German", "pdf"),
+            entry(1, "German", "epub"),
+            entry(2, "English", "epub"),
+            entry(3, "German", "pdf"),
+            entry(4, "English", "pdf"),
+            entry(5, "Spanish", "djvu"),
+        ]
+    }
+
+    #[test]
+    fn cycling_the_language_filter_narrows_the_results() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        assert_eq!(a.visible.len(), 6);
+
+        // Options come most-common-first, so one press lands on German…
+        press(&mut a, KeyCode::Char('l'));
+        assert_eq!(a.lang_filter.as_deref(), Some("German"));
+        assert_eq!(a.visible.len(), 3);
+
+        // …and the next lands on English: the whole point of the feature.
+        press(&mut a, KeyCode::Char('l'));
+        assert_eq!(a.lang_filter.as_deref(), Some("English"));
+        assert_eq!(a.visible.len(), 2);
+        assert!(a.visible.iter().all(|&i| a.results[i].language.as_deref() == Some("English")));
+
+        // Cycling past the end returns to everything.
+        press(&mut a, KeyCode::Char('l')); // Spanish
+        press(&mut a, KeyCode::Char('l')); // back to all
+        assert_eq!(a.lang_filter, None);
+        assert_eq!(a.visible.len(), 6);
+    }
+
+    #[test]
+    fn the_two_filters_compose_and_x_clears_them() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+
+        press(&mut a, KeyCode::Char('l')); // German (most common)
+        press(&mut a, KeyCode::Char('e')); // pdf (most common among German)
+        assert_eq!(a.fmt_filter.as_deref(), Some("pdf"));
+        assert_eq!(a.visible.len(), 2, "German pdfs only");
+
+        press(&mut a, KeyCode::Char('x'));
+        assert_eq!(a.fmt_filter, None);
+        assert_eq!(a.lang_filter, None);
+        assert_eq!(a.visible.len(), 6);
+    }
+
+    #[test]
+    fn facet_counts_respect_the_other_filter() {
+        let mut a = app();
+        install(&mut a, polyglot());
+        a.lang_filter = Some("English".into());
+        a.refine();
+        // With English active there is 1 epub and 1 pdf to offer, not 2 and 3.
+        let formats = a.facet_options(true);
+        assert!(formats.iter().all(|(_, n)| *n == 1), "{formats:?}");
+    }
+
+    #[test]
+    fn filters_survive_a_new_search() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        press(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Char('l'));
+        assert_eq!(a.lang_filter.as_deref(), Some("English"));
+
+        a.handle(Ev::Results(Ok((polyglot(), "libgen.li".into()))));
+        assert_eq!(a.lang_filter.as_deref(), Some("English"), "a standing preference");
+        assert_eq!(a.visible.len(), 2);
+        assert!(a.status.contains("2 of 6"), "{}", a.status);
+    }
+
+    #[test]
+    fn selection_downloads_and_marks_follow_the_visible_rows() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        press(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Char('l')); // English: results 2 and 4
+
+        assert_eq!(a.selected().map(|b| b.md5.clone()).as_deref(), Some("00000000000000000000000000000002"));
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected().map(|b| b.md5.clone()).as_deref(), Some("00000000000000000000000000000004"));
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.table.selected(), Some(1), "two rows showing, no further");
+
+        // `a` marks only what is showing.
+        press(&mut a, KeyCode::Char('a'));
+        assert_eq!(a.marked, [false, false, true, false, true, false]);
+    }
+
+    #[test]
+    fn the_filter_keeps_the_highlighted_book_when_it_survives() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        // Highlight the English pdf (index 4), then filter to pdfs: the book
+        // survives the cut, so the highlight must stay on it.
+        for _ in 0..4 {
+            press(&mut a, KeyCode::Down);
+        }
+        press(&mut a, KeyCode::Char('e')); // pdf, the most common format
+        assert_eq!(a.fmt_filter.as_deref(), Some("pdf"));
+        assert_eq!(
+            a.selected().map(|b| b.md5.clone()).as_deref(),
+            Some("00000000000000000000000000000004"),
+            "the highlight should follow the book, not the row number"
+        );
+        assert_eq!(a.table.selected(), Some(2), "the book moved up the list");
+    }
+
+    #[test]
+    fn the_filter_bar_reports_the_narrowing() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        let screen = draw(&mut a, 100, 24);
+        assert!(screen.contains("6 results"), "{screen}");
+        assert!(screen.contains("format"), "{screen}");
+        assert!(screen.contains("language"), "{screen}");
+
+        press(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Char('l'));
+        let screen = draw(&mut a, 100, 24);
+        assert!(screen.contains("English"), "{screen}");
+        assert!(screen.contains("2 of 6 shown"), "{screen}");
+        assert!(screen.contains("clear"), "{screen}");
+    }
+
+    #[test]
+    fn an_over_narrow_filter_pair_explains_itself() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        a.lang_filter = Some("Spanish".into());
+        a.fmt_filter = Some("epub".into());
+        a.refine();
+        assert!(a.visible.is_empty());
+        let screen = draw(&mut a, 100, 24);
+        assert!(screen.contains("none of the 6 results"), "{screen}");
+        assert!(screen.contains("epub + Spanish"), "{screen}");
+        assert!(screen.contains("clears"), "{screen}");
+    }
+
+    #[test]
+    fn a_wide_terminal_gets_the_side_panel() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(
+            &mut a,
+            vec![Book {
+                md5: "1b9159991f7fb1b3910c0be9ebf7e595".into(),
+                title: "The Dispossessed".into(),
+                authors: Some("Ursula K. Le Guin".into()),
+                publisher: Some("Harper & Row".into()),
+                year: Some("1974".into()),
+                language: Some("English".into()),
+                extension: Some("epub".into()),
+                pages: Some("341".into()),
+                size_bytes: Some(2 * 1024 * 1024),
+                ..Default::default()
+            }],
+        );
+
+        // Wide: the record reads as labelled rows in the right-hand panel.
+        let screen = draw(&mut a, 130, 40);
+        assert!(screen.contains("publisher"), "{screen}");
+        assert!(screen.contains("Harper & Row"), "{screen}");
+        assert!(screen.contains("1b9159991f7fb1b3910c0be9ebf7e595"), "{screen}");
+
+        // Narrow: the old bottom strip, nothing lost.
+        let screen = draw(&mut a, 90, 24);
+        assert!(screen.contains("The Dispossessed"), "{screen}");
+        assert!(screen.contains("1b9159991f7fb1b3910c0be9ebf7e595"), "{screen}");
+    }
+
+    /// Render the app to styled HTML for out-of-terminal design review.
+    /// Dev-only: runs when CLIBGEN_PREVIEW_DIR is set, via `--ignored`.
+    #[test]
+    #[ignore]
+    fn dump_design_previews() {
+        use ratatui::backend::TestBackend;
+        use std::fmt::Write as _;
+
+        let Some(dir) = std::env::var_os("CLIBGEN_PREVIEW_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+
+        fn html(a: &mut App, width: u16, height: u16, title: &str) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| a.render(f)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let css = |c: ratatui::style::Color, fallback: &str| match c {
+                Color::Rgb(r, g, b) => format!("rgb({r},{g},{b})"),
+                _ => fallback.to_string(),
+            };
+            let mut out = format!(
+                "<div class='shot'><h2>{title} <small>{width}×{height}</small></h2><pre>"
+            );
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    let cell = &buffer[(x, y)];
+                    let fg = css(cell.style().fg.unwrap_or(Color::Reset), "rgb(238,241,246)");
+                    let bg = css(cell.style().bg.unwrap_or(Color::Reset), "rgb(16,20,27)");
+                    let bold = if cell.style().add_modifier.contains(Modifier::BOLD) {
+                        "font-weight:bold;"
+                    } else {
+                        ""
+                    };
+                    let symbol = cell
+                        .symbol()
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;");
+                    let _ = write!(
+                        out,
+                        "<span style='color:{fg};background:{bg};{bold}'>{symbol}</span>"
+                    );
+                }
+                out.push('\n');
+            }
+            out.push_str("</pre></div>\n");
+            out
+        }
+
+        fn kapital() -> Vec<Book> {
+            let b = |i: usize,
+                     title: &str,
+                     authors: &str,
+                     publisher: &str,
+                     year: &str,
+                     lang: &str,
+                     pages: &str,
+                     size: u64,
+                     ext: &str| Book {
+                md5: format!("{i:032x}"),
+                title: title.into(),
+                authors: Some(authors.into()),
+                publisher: Some(publisher.into()),
+                year: Some(year.into()),
+                language: Some(lang.into()),
+                pages: Some(pages.into()),
+                size_bytes: Some(size),
+                extension: Some(ext.into()),
+                file_id: None,
+            };
+            vec![
+                b(0, "Das Kapital. Kritik der politischen Ökonomie. Erster Band", "Karl Marx", "Otto Meissner", "1867", "German", "784", 24_600_000, "pdf"),
+                b(1, "Capital: A Critique of Political Economy, Volume I", "Karl Marx; Ben Fowkes (transl.)", "Penguin Classics", "1990", "English", "1152", 2_400_000, "epub"),
+                b(2, "Das Kapital, Band 1", "Karl Marx", "Dietz Verlag", "1962", "German", "955", 18_100_000, "pdf"),
+                b(3, "Capital, Vol. 1: A Critical Analysis of Capitalist Production", "Karl Marx; Samuel Moore", "Progress Publishers", "1887", "English", "802", 5_200_000, "pdf"),
+                b(4, "Das Kapital: Kritik der politischen Ökonomie (Gesamtausgabe)", "Karl Marx; Friedrich Engels", "Akademie Verlag", "1991", "German", "1420", 41_000_000, "pdf"),
+                b(5, "Capital: A Critique of Political Economy, Volume II", "Karl Marx; David Fernbach (transl.)", "Penguin Classics", "1992", "English", "624", 1_900_000, "epub"),
+                b(6, "El Capital: Crítica de la economía política, Tomo I", "Karl Marx", "Siglo XXI Editores", "1975", "Spanish", "381", 9_800_000, "pdf"),
+                b(7, "Das Kapital (Volksausgabe)", "Karl Marx; Karl Kautsky (ed.)", "J.H.W. Dietz", "1914", "German", "698", 31_400_000, "djvu"),
+                b(8, "Капитал. Критика политической экономии. Том 1", "Карл Маркс", "Политиздат", "1983", "Russian", "905", 14_200_000, "djvu"),
+                b(9, "Capital: An Abridged Edition", "Karl Marx; David McLellan (ed.)", "Oxford University Press", "2008", "English", "608", 1_100_000, "epub"),
+                b(10, "Das Kapital, Band 2: Der Zirkulationsprozess des Kapitals", "Karl Marx; Friedrich Engels (ed.)", "Dietz Verlag", "1963", "German", "559", 12_700_000, "pdf"),
+                b(11, "Le Capital, Livre I", "Karl Marx; Joseph Roy (trad.)", "Éditions sociales", "1976", "French", "716", 7_300_000, "pdf"),
+            ]
+        }
+
+        // A plausible 2:3 jacket: a deep vertical gradient with a pale title
+        // band, so the preview judges layout the way a real cover would.
+        let cover = {
+            let (w, h) = (120usize, 180usize);
+            let mut pixels = Vec::with_capacity(w * h * 3);
+            for y in 0..h {
+                for x in 0..w {
+                    let t = y as f32 / h as f32;
+                    let (mut r, mut g, mut b) = (
+                        18.0 + 60.0 * t,
+                        52.0 + 30.0 * (1.0 - t),
+                        84.0 + 90.0 * t,
+                    );
+                    if (30..48).contains(&y) {
+                        (r, g, b) = (226.0, 218.0, 200.0);
+                    }
+                    if x < 4 {
+                        (r, g, b) = (r * 0.6, g * 0.6, b * 0.6);
+                    }
+                    pixels.extend([r as u8, g as u8, b as u8]);
+                }
+            }
+            graphics::Image::new(w, h, pixels)
+        };
+        let mut page = String::from(
+            "<!doctype html><meta charset='utf-8'><style>\
+             body{background:#0a0d12;color:#eef1f6;font-family:system-ui;padding:24px}\
+             h2{font-weight:600;margin:32px 0 8px} h2 small{color:#8892a4;font-weight:400}\
+             pre{font:13px/1.15 'SF Mono',Menlo,monospace;display:inline-block;\
+                 border-radius:8px;overflow:hidden;margin:0;box-shadow:0 8px 40px rgba(0,0,0,.5)}\
+             </style><h1>clibgen — TUI states</h1>",
+        );
+
+        // 1. Wide search, cover art, one download running, one saved.
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        a.mirror_label = "libgen.li".into();
+        a.protocol = Protocol::Blocks;
+        a.library = entries(7); // so the tab bar carries a believable count
+        install(&mut a, kapital());
+        a.covers.insert(
+            "00000000000000000000000000000000".into(),
+            Slot::Ready(Box::new(Art {
+                encoded: Vec::new(),
+                pixels: Some(cover.clone()),
+            })),
+        );
+        a.jobs.insert(
+            "00000000000000000000000000000001".into(),
+            Job::Saved("capital-vol-1.epub".into()),
+        );
+        a.jobs.insert(
+            "00000000000000000000000000000003".into(),
+            Job::Running {
+                done: 2_400_000,
+                total: Some(5_200_000),
+            },
+        );
+        a.marked[9] = true;
+        page.push_str(&html(&mut a, 132, 42, "Search — wide, unfiltered"));
+
+        // 2. The Das Kapital case: English only.
+        a.lang_filter = Some("English".into());
+        a.refine();
+        a.covers.insert(
+            "00000000000000000000000000000001".into(),
+            Slot::Ready(Box::new(Art {
+                encoded: Vec::new(),
+                pixels: Some(cover.clone()),
+            })),
+        );
+        page.push_str(&html(&mut a, 132, 42, "Search — filtered to English"));
+
+        // 3. Both filters: English epubs.
+        a.fmt_filter = Some("epub".into());
+        a.refine();
+        page.push_str(&html(&mut a, 132, 42, "Search — English epubs only"));
+
+        // 4. Narrow terminal, bottom strip.
+        page.push_str(&html(&mut a, 90, 28, "Search — narrow (80–100 col) layout"));
+
+        // 5. Library: real files on disk so `present()` reports the normal
+        // case, and exactly one book gone missing.
+        let mut a = app();
+        with_library(&mut a, {
+            let mut es = entries(6);
+            for (e, (t, au, ext, mb)) in es.iter_mut().zip([
+                ("Capital: A Critique of Political Economy, Volume I", "Karl Marx", "epub", 2.4),
+                ("The Dispossessed", "Ursula K. Le Guin", "epub", 1.1),
+                ("Dune Messiah", "Frank Herbert", "epub", 0.9),
+                ("The Rust Programming Language", "Steve Klabnik; Carol Nichols", "pdf", 11.2),
+                ("Gödel, Escher, Bach", "Douglas Hofstadter", "djvu", 24.0),
+                ("A Wizard of Earthsea", "Ursula K. Le Guin", "mobi", 0.7),
+            ]) {
+                e.title = t.into();
+                e.authors = Some(au.into());
+                e.extension = Some(ext.into());
+                e.size = (mb * 1024.0 * 1024.0) as u64;
+                e.path = dir.join(format!("{t}.{ext}"));
+                std::fs::write(&e.path, "x").unwrap();
+            }
+            es
+        });
+        a.library[4].path = std::path::PathBuf::from("/nonexistent/missing.djvu");
+        a.refilter();
+        page.push_str(&html(&mut a, 100, 26, "Library — narrow"));
+
+        // 5b. Library, wide, with the highlighted book's own cover showing —
+        // the thing the file itself carries, read off disk with no network.
+        a.protocol = Protocol::Blocks;
+        a.library_table.select(Some(0));
+        a.covers.insert(
+            a.library[0].md5.clone(),
+            Slot::Ready(Box::new(Art {
+                encoded: Vec::new(),
+                pixels: Some(cover.clone()),
+            })),
+        );
+        page.push_str(&html(&mut a, 132, 40, "Library — wide, cover from the file"));
+
+        // 6. Help overlay.
+        let mut a = app();
+        a.mode = Mode::Help;
+        install(&mut a, kapital());
+        page.push_str(&html(&mut a, 132, 42, "Help overlay"));
+
+        // 7. First launch, nothing searched yet.
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        a.status = "press / to search".into();
+        a.mirror_label = "libgen.li".into();
+        page.push_str(&html(&mut a, 100, 26, "Empty — first launch"));
+
+        std::fs::write(dir.join("preview.html"), page).unwrap();
     }
 
     #[test]

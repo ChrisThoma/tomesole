@@ -14,6 +14,7 @@ mod args;
 mod config;
 mod cover;
 mod download;
+mod embedded;
 mod error;
 mod graphics;
 mod history;

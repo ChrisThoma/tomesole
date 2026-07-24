@@ -13,27 +13,33 @@ Run `clibgen` with no arguments for the full-screen interface. It has two tabs �
 and `Tab` (or `1`/`2`) moves between them from anywhere, including mid-search:
 
 ```
-╭  1 SEARCH    2 LIBRARY 12  ─────────────────────────────── ● libgen.li ╮
-│❯ author:herbert title:dune                                           │
-╰──────────────────────────────────────────────────────────────────────╯
-    TITLE                        AUTHOR         YEAR LANG    SIZE   FMT
-▌   Dune 1                       Frank Herbert       French  781 KB epub
-    Sisterhood of Dune           Brian Herbert  2012 English 1000 KB epub
-    Heretics of Dune             Frank Herbert  1984 English  937 KB azw3
-╭──────────────────────────────────────────────────────────────────────╮
-│▄▄▄▄▄▄▄▄▄▄▄▄▄▄  Dune 1                                                │
-│██████████████  Frank Herbert                                         │
-│██▀▀▀▀▀▀▀▀▀▀██  Presses Pocket  ·  French  ·  97 pages  ·  781 KB     │
-│██▄▄▄▄▄▄▄▄▄▄██  md5 e7c75dc2964ce80c19cb69140aae8614                  │
-│▀▀▀▀▀▀▀▀▀▀▀▀▀▀  ⏎ download → ~/Downloads                              │
-╰──────────────────────────────────────────────────────────────────────╯
- tab library  ↑↓ move  space mark  ⏎ download  o open  / search  ? help
+╭  1 SEARCH    2 LIBRARY 12  ──────────────────────────────── ● libgen.li ╮
+│❯ dune                                                                   │
+╰─────────────────────────────────────────────────────────────────────────╯
+ e format all    l language English 6    x clear             6 of 14 shown
+   TITLE                 AUTHOR         YEAR LANGUAGE  SIZE     FMT  ╭────╮
+▌  Dune                  Frank Herbert  1965 English   781 KB  epub │▄▄▄▄│
+   Dune Messiah          Frank Herbert  1969 English   922 KB  epub │████│
+   Children of Dune      Frank Herbert  1976 English   1.1 MB  pdf  │▀▀▀▀│
+                                                                    ╰────╯
+ tab library  ↑↓ move  space mark  ⏎ download  e format  l language  ? help
 ```
 
-The active tab is a solid accent chip, the highlighted row carries a `▌` bar
-that reads even when the list holds a single item, and colour is used sparingly:
-one teal accent for what's interactive, a warm amber for a file's format and your
-book count, three levels of grey for everything else.
+The interface paints its own canvas — a deep blue-grey with zebra-striped
+rows — rather than inheriting the terminal's colours, and colour carries
+meaning: teal is interactive, amber is emphasis, every file format keeps one
+hue of its own (`epub` green, `pdf` coral, `djvu` violet…) drawn as a solid
+chip, and languages share one calm blue. On a wide terminal the right-hand
+panel shows the cover near poster size with the record beneath it as labelled
+rows; narrower ones get a compact strip along the bottom.
+
+A search brings back whatever the mirror has — *Das Kapital* is forty German
+editions with the English translations scattered among them. So the results
+can be carved in place, no re-search needed: `e` cycles through the formats
+actually present, `l` through the languages, each option shown with a live
+count, and the bar under the search box always says how much of the catch is
+on screen (`4 of 40 shown`). The filters are standing preferences — they
+survive the next search — and `x` clears them.
 
 The **Library** tab lists every book you have downloaded, newest first, and
 persists between sessions — it is a view onto `~/.local/share/clibgen/history.tsv`.
@@ -47,7 +53,11 @@ responsive while a large file comes down. Downloads run one at a time — firing
 parallel requests at a volunteer-run mirror is a good way to get rate-limited.
 
 The cover is drawn as real pixels in kitty, Ghostty, WezTerm and iTerm2, and as
-half-block characters — sketched above — anywhere else.
+half-block characters — sketched above — anywhere else. On the Library tab the
+cover comes out of the book file you already downloaded — an EPUB or CBZ is a
+zip with the image inside, a MOBI/AZW embeds it — so it needs no network at all;
+only when the file carries none does it fall back to a cover cached from an
+earlier search.
 
 | key | does |
 | --- | --- |
@@ -55,7 +65,9 @@ half-block characters — sketched above — anywhere else.
 | `/` `i` | type in the box (search terms, or a library filter) |
 | `⏎` | search / download the selection, or open a library book |
 | `↑` `↓` `k` `j` | move; `PgUp`/`PgDn` for ten, `g`/`G` for ends |
-| `space` | mark a result; `a` marks or unmarks everything |
+| `e` `E` | cycle the format filter through what the results contain |
+| `l` `L` | cycle the language filter; `x` clears both filters |
+| `space` | mark a result; `a` marks or unmarks everything showing |
 | `o` `f` | open a downloaded book, or show it in the file manager |
 | `d` | forget a library entry (the file stays) |
 | `r` | re-run the search / re-read the library |
@@ -115,6 +127,15 @@ How it draws depends on what the terminal can do:
 | kitty, Ghostty, WezTerm | kitty graphics protocol — real pixels |
 | iTerm2 | inline image protocol — real pixels |
 | anything else with colour | half-block characters, two pixels per cell |
+
+A search result is only an MD5, so its cover is fetched from the mirror as
+above. A book in your library is a file on disk, and most formats carry their
+own jacket — so the Library tab reads it straight out of the file (EXTH record
+201 in a MOBI, the cover image inside an EPUB or CBZ zip) with no request at
+all. Every byte is treated as hostile: offsets and lengths are bounds-checked,
+nothing is decompressed in place, the extracted bytes must still begin with a
+real image signature, and a truncated or malformed book yields no cover rather
+than a crash.
 
 Detection is from the environment, never by writing a query escape and waiting
 for a reply — that races with the keyboard reader for the answer. `clibgen
@@ -310,7 +331,7 @@ page.
 cargo test
 ```
 
-229 tests, no network needed. They cover the MD5 vectors, the SSRF and scheme
+259 tests, no network needed. They cover the MD5 vectors, the SSRF and scheme
 guards, filename sanitising against traversal and executable extensions, HTML
 scanning against real markup, and the streaming download path — including that
 a file failing its checksum is discarded and leaves nothing behind — against a
@@ -324,7 +345,10 @@ metadata, since the format is tab-separated and the metadata comes from Libgen.
 
 One test is `#[ignore]`d because it needs the network: `cargo test -- --ignored
 covers_can_be_fetched` fetches real covers from a live mirror, which is how the
-hotlink protection on cover images was found in the first place.
+hotlink protection on cover images was found in the first place. A second,
+`dump_design_previews`, renders the interface's main states to a styled HTML
+page for design review — set `CLIBGEN_PREVIEW_DIR` to somewhere writable and
+run it with `--ignored`.
 
 The TUI is tested through ratatui's off-screen backend: key handling, cover
 placement, and that it draws without panicking from an 20×8 terminal up to
