@@ -45,25 +45,26 @@ use crate::{Settings, cover, download, history, launch, libgen, mirror, net, que
 mod theme {
     use ratatui::style::{Color, Modifier, Style};
 
-    /// The canvas painted under every frame.
-    pub const BG: Color = Color::Rgb(16, 20, 27);
+    /// The canvas painted under every frame. Deep navy-black: the darker the
+    /// ground, the harder the true-colour accents pop off it.
+    pub const BG: Color = Color::Rgb(13, 17, 25);
     /// Every other table row, one step off the canvas: enough for the eye to
     /// track a row across a wide screen, not enough to read as stripes.
-    pub const BG_ALT: Color = Color::Rgb(22, 27, 36);
-    pub const ACCENT: Color = Color::Rgb(88, 216, 216); // teal — interactive
-    pub const ACCENT_DEEP: Color = Color::Rgb(56, 148, 152);
-    pub const AMBER: Color = Color::Rgb(242, 190, 106); // emphasis
-    pub const TEXT: Color = Color::Rgb(238, 241, 246);
-    pub const MUTED: Color = Color::Rgb(173, 181, 196);
-    pub const FAINT: Color = Color::Rgb(112, 121, 137);
-    pub const SUCCESS: Color = Color::Rgb(140, 220, 150);
-    pub const DANGER: Color = Color::Rgb(244, 120, 130);
-    /// Languages get one colour of their own — a calm blue — because they are
-    /// one of the two facets the interface filters by.
-    pub const LANG: Color = Color::Rgb(142, 180, 252);
+    pub const BG_ALT: Color = Color::Rgb(23, 29, 42);
+    pub const ACCENT: Color = Color::Rgb(58, 232, 219); // aqua — interactive
+    pub const ACCENT_DEEP: Color = Color::Rgb(96, 202, 210);
+    pub const AMBER: Color = Color::Rgb(255, 197, 92); // emphasis
+    pub const TEXT: Color = Color::Rgb(241, 245, 251);
+    pub const MUTED: Color = Color::Rgb(186, 196, 214);
+    pub const FAINT: Color = Color::Rgb(139, 150, 172);
+    pub const SUCCESS: Color = Color::Rgb(102, 231, 145);
+    pub const DANGER: Color = Color::Rgb(255, 110, 122);
+    /// Languages get one colour of their own — a bright cornflower blue —
+    /// because they are one of the two facets the interface filters by.
+    pub const LANG: Color = Color::Rgb(135, 184, 255);
     /// The wash behind the highlighted row: a teal tint, bright enough to be
     /// plainly the cursor, dim enough to sit under white text.
-    pub const SELECT_BG: Color = Color::Rgb(31, 54, 61);
+    pub const SELECT_BG: Color = Color::Rgb(28, 62, 72);
 
     /// The gutter that marks the selected row. A solid bar reads as "here" even
     /// when the list holds a single item, which a mere background tint does not.
@@ -86,12 +87,12 @@ mod theme {
     /// epubs" becomes something the eye learns in seconds.
     pub fn format_color(ext: &str) -> Color {
         match ext.to_ascii_lowercase().as_str() {
-            "epub" => Color::Rgb(129, 201, 141),
-            "pdf" => Color::Rgb(240, 138, 126),
-            "mobi" | "azw" | "azw3" => Color::Rgb(235, 180, 100),
-            "djvu" => Color::Rgb(198, 160, 246),
-            "cbz" | "cbr" => Color::Rgb(240, 150, 200),
-            _ => Color::Rgb(148, 156, 170),
+            "epub" => Color::Rgb(88, 226, 140),
+            "pdf" => Color::Rgb(255, 126, 110),
+            "mobi" | "azw" | "azw3" => Color::Rgb(250, 190, 80),
+            "djvu" => Color::Rgb(196, 150, 255),
+            "cbz" | "cbr" => Color::Rgb(250, 142, 206),
+            _ => Color::Rgb(154, 166, 188),
         }
     }
 
@@ -2672,7 +2673,7 @@ impl App {
                     Cell::from(book.year.clone().unwrap_or_default()).style(theme::faint()),
                     Cell::from(book.language.clone().unwrap_or_default())
                         .style(Style::new().fg(theme::LANG)),
-                    Cell::from(book.size_human()).style(theme::faint()),
+                    Cell::from(book.size_human()).style(theme::muted()),
                     Cell::from(format!(" {} ", book.ext())).style(chip),
                     Cell::from(status_text).style(status_style),
                 ])
@@ -3504,7 +3505,7 @@ impl App {
                     (*key).to_string(),
                     theme::accent().add_modifier(Modifier::BOLD),
                 ));
-                spans.push(Span::styled(format!(" {label}"), theme::faint()));
+                spans.push(Span::styled(format!(" {label}"), theme::muted()));
             } else {
                 spans.push(Span::styled((*label).to_string(), theme::faint()));
             }
