@@ -2680,6 +2680,30 @@ impl App {
         }
         let header = Row::new(head).style(theme::header()).height(1);
 
+        // Titles carry the information; authors repeat. Weight the room so the
+        // title always wins the slack the fixed columns leave behind.
+        let mut widths = vec![Constraint::Length(1), Constraint::Fill(6), Constraint::Fill(2)];
+        if show_year {
+            widths.push(Constraint::Length(4));
+        }
+        if show_lang {
+            widths.push(Constraint::Length(10));
+        }
+        widths.push(Constraint::Length(8)); // SIZE
+        widths.push(Constraint::Length(6)); // FMT
+        if show_status {
+            widths.push(Constraint::Length(7)); // STATUS
+        }
+        // The width the title and author columns will actually get, so a row can
+        // decide for itself whether it needs a second line — the highlight
+        // gutter eats two cells on the left of every row.
+        let gutter = crate::term::display_width(theme::CURSOR) as u16;
+        let cols = Layout::horizontal(widths.clone())
+            .spacing(1)
+            .split(Rect::new(0, 0, area.width.saturating_sub(gutter), 1));
+        let title_w = cols[1].width as usize;
+        let author_w = cols[2].width as usize;
+
         let selected = self.table.selected();
         let rows: Vec<Row> = self
             .visible
@@ -2734,10 +2758,18 @@ impl App {
                     theme::format_chip(book.ext())
                 };
 
+                // Title and author each spill onto a second line only when they
+                // outrun their column; a row that fits stays one line, so the
+                // list keeps its density and spends the extra row only where a
+                // long title would otherwise be cut.
+                let title_lines = wrap_two(&book.title, title_w);
+                let author_lines = wrap_two(&author, author_w);
+                let row_h = title_lines.len().max(author_lines.len()) as u16;
+
                 let mut cells = vec![
                     Cell::from(marker).style(marker_style),
-                    Cell::from(book.title.clone()).style(title_style),
-                    Cell::from(author).style(theme::muted()),
+                    Cell::from(as_text(title_lines)).style(title_style),
+                    Cell::from(as_text(author_lines)).style(theme::muted()),
                 ];
                 if show_year {
                     cells.push(
@@ -2757,7 +2789,7 @@ impl App {
                 }
                 // The zebra: alternate rows sit one step off the canvas, so a
                 // wide row can be followed without a ruler.
-                Row::new(cells).style(Style::new().bg(if row % 2 == 1 {
+                Row::new(cells).height(row_h).style(Style::new().bg(if row % 2 == 1 {
                     theme::BG_ALT
                 } else {
                     theme::BG
@@ -2765,28 +2797,14 @@ impl App {
             })
             .collect();
 
-        // Titles carry the information; authors repeat. Weight the room so the
-        // title always wins the slack the fixed columns leave behind.
-        let mut widths = vec![Constraint::Length(1), Constraint::Fill(6), Constraint::Fill(2)];
-        if show_year {
-            widths.push(Constraint::Length(4));
-        }
-        if show_lang {
-            widths.push(Constraint::Length(10));
-        }
-        widths.push(Constraint::Length(8)); // SIZE
-        widths.push(Constraint::Length(6)); // FMT
-        if show_status {
-            widths.push(Constraint::Length(7)); // STATUS
-        }
         let table = Table::new(rows, widths)
             .header(header)
-        .column_spacing(1)
-        .row_highlight_style(theme::selected_row())
-        .highlight_symbol(Span::styled(
-            theme::CURSOR,
-            theme::accent().add_modifier(Modifier::BOLD),
-        ));
+            .column_spacing(1)
+            .row_highlight_style(theme::selected_row())
+            .highlight_symbol(Span::styled(
+                theme::CURSOR,
+                theme::accent().add_modifier(Modifier::BOLD),
+            ));
 
         frame.render_stateful_widget(table, area, &mut self.table);
     }
@@ -3062,6 +3080,23 @@ impl App {
         head.push(Cell::from("FMT"));
         let header = Row::new(head).style(theme::header()).height(1);
 
+        let mut widths = vec![Constraint::Length(1), Constraint::Fill(6), Constraint::Fill(2)];
+        if show_added {
+            widths.push(Constraint::Length(12));
+        }
+        if show_size {
+            widths.push(Constraint::Length(9));
+        }
+        widths.push(Constraint::Length(6)); // FMT
+        // The real title and author widths, so a shelf row wraps to a second
+        // line only when its own title or author overruns the column.
+        let gutter = crate::term::display_width(theme::CURSOR) as u16;
+        let cols = Layout::horizontal(widths.clone())
+            .spacing(1)
+            .split(Rect::new(0, 0, area.width.saturating_sub(gutter), 1));
+        let title_w = cols[1].width as usize;
+        let author_w = cols[2].width as usize;
+
         let selected = self.library_table.selected();
         let rows: Vec<Row> = self
             .shown
@@ -3101,10 +3136,15 @@ impl App {
                     theme::format_chip(entry.ext())
                 };
 
+                let author = entry.first_author();
+                let title_lines = wrap_two(&title, title_w);
+                let author_lines = wrap_two(&author, author_w);
+                let row_h = title_lines.len().max(author_lines.len()) as u16;
+
                 let mut cells = vec![
                     Cell::from(marker).style(marker_style),
-                    Cell::from(title).style(title_style),
-                    Cell::from(entry.first_author()).style(theme::muted()),
+                    Cell::from(as_text(title_lines)).style(title_style),
+                    Cell::from(as_text(author_lines)).style(theme::muted()),
                 ];
                 if show_added {
                     cells.push(Cell::from(history::when(entry.at, now)).style(theme::muted()));
@@ -3113,7 +3153,7 @@ impl App {
                     cells.push(Cell::from(human_bytes(entry.size)).style(theme::faint()));
                 }
                 cells.push(Cell::from(format!(" {} ", entry.ext())).style(chip));
-                Row::new(cells).style(Style::new().bg(if row % 2 == 1 {
+                Row::new(cells).height(row_h).style(Style::new().bg(if row % 2 == 1 {
                     theme::BG_ALT
                 } else {
                     theme::BG
@@ -3121,14 +3161,6 @@ impl App {
             })
             .collect();
 
-        let mut widths = vec![Constraint::Length(1), Constraint::Fill(6), Constraint::Fill(2)];
-        if show_added {
-            widths.push(Constraint::Length(12));
-        }
-        if show_size {
-            widths.push(Constraint::Length(9));
-        }
-        widths.push(Constraint::Length(6)); // FMT
         let table = Table::new(rows, widths)
             .header(header)
             .column_spacing(1)
@@ -3474,6 +3506,63 @@ fn facet_value_span(facet: Facet, value: &str) -> Span<'static> {
             clip(value, 30),
             theme::text().add_modifier(Modifier::BOLD),
         ),
+    }
+}
+
+/// A run of lines as cell text, so a table cell can hold a wrapped title.
+fn as_text(lines: Vec<String>) -> Text<'static> {
+    Text::from(lines.into_iter().map(Line::from).collect::<Vec<Line>>())
+}
+
+/// Wrap `s` into at most two lines of `width` display cells, breaking on
+/// spaces. A string that already fits comes back as a single line, so a table
+/// row only grows to two lines when its own text would otherwise be cut; a
+/// third line's worth spills onto the second and is clipped with an ellipsis.
+fn wrap_two(s: &str, width: usize) -> Vec<String> {
+    use crate::term::{display_width, truncate};
+    if width == 0 || display_width(s) <= width {
+        return vec![s.to_string()];
+    }
+    let mut line = String::new();
+    let mut used = 0usize;
+    let mut rest = String::new();
+    let mut spilling = false;
+    for word in s.split(' ') {
+        if spilling {
+            rest.push(' ');
+            rest.push_str(word);
+            continue;
+        }
+        let ww = display_width(word);
+        if line.is_empty() && ww > width {
+            // A single word wider than the whole line: hard-break it so the
+            // overflow still has somewhere to land.
+            for c in word.chars() {
+                let cw = display_width(&c.to_string());
+                if used + cw > width {
+                    rest.push(c);
+                } else {
+                    line.push(c);
+                    used += cw;
+                }
+            }
+            spilling = true;
+        } else if !line.is_empty() && used + 1 + ww > width {
+            rest.push_str(word);
+            spilling = true;
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+                used += 1;
+            }
+            line.push_str(word);
+            used += ww;
+        }
+    }
+    if rest.is_empty() {
+        vec![line]
+    } else {
+        vec![line, truncate(&rest, width)]
     }
 }
 
