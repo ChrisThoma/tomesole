@@ -362,7 +362,7 @@ pub fn fetch(
             .with_context(|| format!("could not seek in {}", part_path.display()))?;
         f
     } else {
-        create_private_file(&part_path)?
+        crate::config::create_private_file(&part_path)?
     };
 
     let total_expected = response.content_length.map(|l| l + already);
@@ -512,20 +512,6 @@ fn hash_existing(file: &mut std::fs::File, hasher: &mut Md5, len: u64) -> Result
         remaining -= n as u64;
     }
     Ok(())
-}
-
-/// Create the temp file readable only by the current user.
-fn create_private_file(path: &Path) -> Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .with_context(|| format!("could not create {}", path.display()))
 }
 
 /// Tag the file the way a browser would, so Gatekeeper still evaluates it.

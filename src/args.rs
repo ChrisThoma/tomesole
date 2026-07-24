@@ -26,6 +26,20 @@ pub enum Command {
     Mirrors {
         refresh: bool,
     },
+    /// List what has been downloaded.
+    History {
+        limit: Option<usize>,
+        clear: bool,
+    },
+    /// Open something from the history, or show it in the file manager.
+    Open {
+        /// A position in the history, an MD5, or text to match. Empty means
+        /// the most recent download.
+        selector: String,
+        reveal: bool,
+        /// Application to open with, overriding the configured reader.
+        with: Option<String>,
+    },
     /// Full-screen interface. `query` pre-fills the search box.
     Tui {
         query: Option<String>,
@@ -68,6 +82,9 @@ pub struct Global {
     pub no_color: bool,
     pub quiet: bool,
     pub json: bool,
+    /// Application to open books with, overriding the config file.
+    pub reader: Option<String>,
+    pub no_covers: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,8 +93,9 @@ pub struct Cli {
     pub global: Global,
 }
 
-const SUBCOMMANDS: [&str; 8] = [
-    "search", "get", "mirrors", "config", "doctor", "help", "version", "tui",
+const SUBCOMMANDS: [&str; 11] = [
+    "search", "get", "mirrors", "config", "doctor", "help", "version", "tui", "history", "open",
+    "reveal",
 ];
 
 /// Parse arguments, excluding the program name.
@@ -93,6 +111,10 @@ pub fn parse(argv: &[String]) -> Result<Cli> {
     let mut mirrors_refresh = false;
     let mut config_init = false;
     let mut config_path = false;
+    let mut clear = false;
+    let mut reveal = command_name == Some("reveal");
+    let mut with: Option<String> = None;
+    let mut find: Option<String> = None;
     let mut i = 0usize;
     let mut flags_done = false;
 
@@ -281,6 +303,10 @@ pub fn parse(argv: &[String]) -> Result<Cli> {
                 global.quiet = true;
                 i += 1;
             }
+            "--no-covers" | "--no-images" => {
+                global.no_covers = true;
+                i += 1;
+            }
 
             // `config` options.
             "--init" => {
@@ -292,8 +318,39 @@ pub fn parse(argv: &[String]) -> Result<Cli> {
                 i += 1;
             }
 
+            // `history` and `open` options.
+            "--clear" => {
+                clear = true;
+                i += 1;
+            }
+            "-R" | "--reveal" => {
+                reveal = true;
+                i += 1;
+            }
+            "-w" | "--with" | "--reader" => {
+                let app = take_value(&flag, &mut i)?;
+                global.reader = Some(app.clone());
+                with = Some(app);
+            }
+            // `open` takes a history position or an MD5 as a bare argument.
+            // Matching by text needs a flag, because a bare word after `open`
+            // is far more likely to be the start of a search.
+            "--find" | "--match" => find = Some(take_value(&flag, &mut i)?),
+
             other => bail!("unknown option `{other}` (try `clibgen --help`)"),
         }
+    }
+
+    // A command word that turned out to be the first word of a query goes back
+    // where it came from.
+    if is_really_a_query(command_name, &positionals) {
+        let mut terms = vec![command_name.unwrap_or_default().to_string()];
+        terms.append(&mut positionals);
+        search.terms = terms;
+        return Ok(Cli {
+            command: Command::Search(search),
+            global,
+        });
     }
 
     let command = match command_name {
@@ -305,6 +362,15 @@ pub fn parse(argv: &[String]) -> Result<Cli> {
         },
         Some("mirrors") => Command::Mirrors {
             refresh: mirrors_refresh,
+        },
+        Some("history") => Command::History {
+            limit: search.limit,
+            clear,
+        },
+        Some("open") | Some("reveal") => Command::Open {
+            selector: find.unwrap_or_else(|| positionals.join(" ")),
+            reveal,
+            with,
         },
         Some("config") => Command::Config {
             init: config_init,
@@ -348,6 +414,27 @@ fn split_command(argv: &[String]) -> (Option<&str>, &[String]) {
     match argv.first() {
         Some(first) if SUBCOMMANDS.contains(&first.as_str()) => (Some(first.as_str()), &argv[1..]),
         _ => (None, argv),
+    }
+}
+
+/// Whether a leading `history`, `open` or `reveal` was really the start of a
+/// query rather than a command.
+///
+/// All three are perfectly ordinary things to want a book about, so they only
+/// hold onto their meaning when what follows fits: `clibgen history` lists
+/// downloads, `clibgen history of the peloponnesian war` looks for a book. The
+/// check runs after flag parsing, so a flag's value is never mistaken for a
+/// query word.
+fn is_really_a_query(command: Option<&str>, positionals: &[String]) -> bool {
+    match command {
+        Some("history") => !positionals.is_empty(),
+        Some("open") | Some("reveal") => {
+            positionals.len() > 1
+                || positionals
+                    .iter()
+                    .any(|p| p.parse::<usize>().is_err() && !crate::model::is_md5(p))
+        }
+        _ => false,
     }
 }
 
@@ -412,6 +499,9 @@ pub fn help_text(style: &crate::term::Style) -> String {
         ("clibgen", "open the full-screen interface"),
         ("clibgen <query>...", "search, then pick what to download"),
         ("clibgen get <md5>", "download a file you already know"),
+        ("clibgen history", "list what has been downloaded"),
+        ("clibgen open [n]", "open a download in your reader"),
+        ("clibgen reveal [n]", "show a download in the file manager"),
         ("clibgen mirrors", "show which mirrors are usable"),
         ("clibgen config --init", "write a starter config file"),
         ("clibgen doctor", "check the setup end to end"),
@@ -446,6 +536,16 @@ pub fn help_text(style: &crate::term::Style) -> String {
     ]);
     flush(&mut out, style, &mut rows, FLAG_WIDTH);
 
+    section(&mut out, style, "HISTORY");
+    rows.extend([
+        ("-n, --limit <n>", "how many entries to list"),
+        ("--clear", "forget every download and cached cover"),
+        ("-w, --with <app>", "open with this application"),
+        ("-R, --reveal", "show in the file manager instead"),
+        ("--find <text>", "pick by title or author, not position"),
+    ]);
+    flush(&mut out, style, &mut rows, FLAG_WIDTH);
+
     section(&mut out, style, "MIRRORS");
     rows.extend([
         ("-m, --mirror <url>", "use this mirror instead of choosing"),
@@ -458,6 +558,7 @@ pub fn help_text(style: &crate::term::Style) -> String {
         ("--json", "machine-readable results"),
         ("-q, --quiet", "print only paths and errors"),
         ("--no-color", "disable colour"),
+        ("--no-covers", "do not fetch or draw cover art"),
         ("--allow-http", "permit cleartext http mirrors"),
         ("-h, --help", "show this help"),
         ("-V, --version", "show the version"),
@@ -468,10 +569,25 @@ pub fn help_text(style: &crate::term::Style) -> String {
     for example in [
         "clibgen the pragmatic programmer",
         "clibgen -a \"Ursula K. Le Guin\" -e epub",
-        "clibgen --title dune --lang english -n 50",
+        "clibgen author:herbert title:dune ext:epub",
         "clibgen get 1b9159991f7fb1b3910c0be9ebf7e595",
+        "clibgen history -n 10",
+        "clibgen open 3 --with Preview",
     ] {
         out.push_str(&format!("  {}\n", style.dim(example)));
+    }
+
+    section(&mut out, style, "TAGS");
+    out.push_str(&format!(
+        "  {}\n",
+        style.dim("Any query, here or in the interface, can carry these:")
+    ));
+    for (tag, what) in crate::query::TAGS {
+        out.push_str(&format!(
+            "  {}{}\n",
+            style.cyan(&crate::term::pad(tag, 12)),
+            style.dim(what)
+        ));
     }
 
     out.push_str(&format!(
@@ -650,6 +766,87 @@ mod tests {
             cli.global.mirrors,
             ["https://a.example", "https://b.example"]
         );
+    }
+
+    #[test]
+    fn history_and_open_are_recognised() {
+        assert_eq!(
+            parse_args(&["history"]).unwrap().command,
+            Command::History {
+                limit: None,
+                clear: false
+            }
+        );
+        assert_eq!(
+            parse_args(&["history", "-n", "5", "--clear"])
+                .unwrap()
+                .command,
+            Command::History {
+                limit: Some(5),
+                clear: true
+            }
+        );
+        assert_eq!(
+            parse_args(&["open"]).unwrap().command,
+            Command::Open {
+                selector: String::new(),
+                reveal: false,
+                with: None
+            }
+        );
+        assert_eq!(
+            parse_args(&["open", "3", "--with", "Preview"])
+                .unwrap()
+                .command,
+            Command::Open {
+                selector: "3".into(),
+                reveal: false,
+                with: Some("Preview".into())
+            }
+        );
+        // `reveal` is the same command with the flag already set.
+        assert_eq!(
+            parse_args(&["reveal", "2"]).unwrap().command,
+            Command::Open {
+                selector: "2".into(),
+                reveal: true,
+                with: None
+            }
+        );
+        assert_eq!(
+            parse_args(&["open", "--find", "dune"]).unwrap().command,
+            Command::Open {
+                selector: "dune".into(),
+                reveal: false,
+                with: None
+            }
+        );
+    }
+
+    /// These three are also ordinary words, and a search must win.
+    #[test]
+    fn command_words_still_work_as_queries() {
+        assert_eq!(
+            search_of(parse_args(&["history", "of", "the", "world"]).unwrap()).terms,
+            ["history", "of", "the", "world"]
+        );
+        assert_eq!(
+            search_of(parse_args(&["open", "source", "software"]).unwrap()).terms,
+            ["open", "source", "software"]
+        );
+        // An MD5 or a number after `open` is unambiguous, so that stays a
+        // command rather than becoming a two-word search.
+        assert!(matches!(
+            parse_args(&["open", "1"]).unwrap().command,
+            Command::Open { .. }
+        ));
+    }
+
+    #[test]
+    fn tags_in_a_bare_query_are_left_for_the_search_to_parse() {
+        // Parsing keeps the tag text intact; `query::apply` interprets it.
+        let s = search_of(parse_args(&["author:herbert", "dune"]).unwrap());
+        assert_eq!(s.terms, ["author:herbert", "dune"]);
     }
 
     #[test]

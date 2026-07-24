@@ -280,6 +280,25 @@ pub fn hrefs(html: &str) -> Vec<String> {
     anchors(html).into_iter().map(|(href, _)| href).collect()
 }
 
+/// Collect the `src` of every `<img>` in `html`, in document order.
+///
+/// `<img>` has no closing tag, so it cannot go through [`anchors`].
+pub fn img_srcs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(t) = next_tag(html, cursor) {
+        if !t.closing
+            && t.name == "img"
+            && let Some(src) = get_attr(t.attrs, "src")
+            && !src.trim().is_empty()
+        {
+            out.push(src);
+        }
+        cursor = t.end;
+    }
+    out
+}
+
 /// Collect `(href, inner_html)` for every `<a>` in `html`, in document order.
 ///
 /// Needed because which link a cell means is decided by where it points, not

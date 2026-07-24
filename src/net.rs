@@ -243,6 +243,22 @@ impl Http {
     ///
     /// `range` optionally requests a byte range, used to resume downloads.
     pub fn get(&self, uri: &Uri, range: Option<u64>) -> Result<Fetched> {
+        self.request(uri, range, None)
+    }
+
+    /// A GET that says which page it came from.
+    ///
+    /// Needed for cover art: the mirrors serve an empty file to anyone asking
+    /// for an image without a `Referer`, which is ordinary hotlink protection
+    /// and not something to route around — we really did come from that page.
+    ///
+    /// The header is only sent to the host it names, so a redirect elsewhere
+    /// cannot be used to learn which record was being looked at.
+    pub fn get_referred(&self, uri: &Uri, referer: &Uri) -> Result<Fetched> {
+        self.request(uri, None, Some(referer))
+    }
+
+    fn request(&self, uri: &Uri, range: Option<u64>, referer: Option<&Uri>) -> Result<Fetched> {
         let mut current = uri.clone();
         let mut hops = 0usize;
 
@@ -258,6 +274,12 @@ impl Http {
 
             if let Some(from) = range {
                 req = req.header("Range", format!("bytes={from}-"));
+            }
+            if let Some(referer) = referer
+                && let (Ok(a), Ok(b)) = (host_of(referer), host_of(&current))
+                && a.eq_ignore_ascii_case(&b)
+            {
+                req = req.header("Referer", referer.to_string());
             }
             // Ask for identity when ranging: a re-encoded body would break the
             // byte offsets we are resuming from.
