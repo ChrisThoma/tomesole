@@ -16,13 +16,13 @@ and `Tab` (or `1`/`2`) moves between them from anywhere, including mid-search:
 ╭  1 SEARCH    2 LIBRARY 12  ──────────────────────────────── ● libgen.li ╮
 │❯ dune                                                                   │
 ╰─────────────────────────────────────────────────────────────────────────╯
- e format all   l language English 6   x clear   s sort year ▼   6 of 14
+ e format all   l language English 6   a author all   x clear   s sort year ▼
    TITLE                AUTHOR         YEAR LANG     SIZE   FMT  STATUS ╭──╮
 ▌  Dune                 Frank Herbert  1965 English 781 KB epub library│▄▄│
    Dune Messiah         Frank Herbert  1969 English 922 KB epub        │██│
    Children of Dune     Frank Herbert  1976 English 1.1 MB pdf         │▀▀│
                                                                        ╰──╯
- tab library  ↑↓ move  ⏎ download  e format  l language  s sort  ? help
+ tab library  ↑↓ move  ⏎ download  e format  l lang  a author  s sort  ? help
 ```
 
 The interface paints its own canvas — a deep blue-grey with zebra-striped
@@ -35,11 +35,15 @@ rows; narrower ones get a compact strip along the bottom.
 
 A search brings back whatever the mirror has — *Das Kapital* is forty German
 editions with the English translations scattered among them. So the results
-can be carved in place, no re-search needed: `e` cycles through the formats
-actually present, `l` through the languages, each option shown with a live
-count, and the bar under the search box always says how much of the catch is
-on screen (`4 of 40 shown`). The filters are standing preferences — they
-survive the next search — and `x` clears them.
+can be carved in place, no re-search needed. `e`, `l` and `a` each open a
+little menu of the values actually present — the formats, the languages, the
+authors — every one with a live count of what choosing it would leave. It is a
+pick-list, not a cycle: type a fragment to narrow the menu (`guin` finds *Le
+Guin, Ursula* among eighty names), arrow or Enter to choose, and `⇥` rotates
+between the three facets without leaving the pop-over. The bar under the search
+box always says how much of the catch is on screen (`4 of 40 shown`). The
+filters are standing preferences — they survive the next search — and `x`
+clears them all.
 
 A ragged pile also wants an order. `s` cycles the sort — relevance (the
 mirror's own guess), then title, author, year and size — and `S` reverses it,
@@ -77,10 +81,9 @@ earlier search.
 | `/` `i` | type in the box (search terms, or a library filter) |
 | `⏎` | search / download the selection, or open a library book |
 | `↑` `↓` `k` `j` | move; `PgUp`/`PgDn` for ten, `g`/`G` for ends |
-| `e` `E` | cycle the format filter through what the results contain |
-| `l` `L` | cycle the language filter; `x` clears both filters |
+| `e` `l` `a` | open the format / language / author menu (type to narrow, `⏎` to choose, `⇥` to switch facet); `x` clears every filter |
 | `s` `S` | cycle the sort (relevance, title, author, year, size); `S` reverses it |
-| `space` | mark a result; `a` marks or unmarks everything showing |
+| `space` | mark a result; `A` marks or unmarks everything showing |
 | `y` | copy the highlighted book's MD5 to the clipboard |
 | `o` `f` | open a downloaded book, or show it in the file manager |
 | `d` | forget a library entry (the file stays) |

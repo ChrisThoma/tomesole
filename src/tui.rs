@@ -257,6 +257,127 @@ impl Sort {
     }
 }
 
+/// One of the columns the results can be narrowed by after they arrive.
+///
+/// A Libgen search brings back a ragged pile — forty editions of one book in a
+/// dozen languages, its authors repeating down the list. Format and language
+/// are low-cardinality, a handful of values, so they read as a menu; author is
+/// high-cardinality, so the same overlay leans on its type-to-narrow line.
+/// Treating all three the same way is what lets one gesture — open, type or
+/// arrow, Enter — stand in for the blind cycle that came before and could not
+/// touch the author column at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Facet {
+    Format,
+    Language,
+    Author,
+}
+
+impl Facet {
+    const ALL: [Facet; 3] = [Facet::Format, Facet::Language, Facet::Author];
+
+    fn label(self) -> &'static str {
+        match self {
+            Facet::Format => "format",
+            Facet::Language => "language",
+            Facet::Author => "author",
+        }
+    }
+
+    /// The key that opens this facet's picker, echoed in the strip and hints.
+    fn key(self) -> char {
+        match self {
+            Facet::Format => 'e',
+            Facet::Language => 'l',
+            Facet::Author => 'a',
+        }
+    }
+
+    fn next(self) -> Self {
+        let at = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ALL[(at + 1) % Self::ALL.len()]
+    }
+
+    fn prev(self) -> Self {
+        let at = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ALL[(at + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The value this facet reads off a record, as the menu and the counts see
+    /// it. Format is lowercased so `EPUB` and `epub` fold into one row; the
+    /// others keep the mirror's own casing.
+    fn value_of(self, book: &Book) -> String {
+        match self {
+            Facet::Format => book.ext().to_ascii_lowercase(),
+            Facet::Language => book.language.as_deref().unwrap_or("unknown").to_string(),
+            Facet::Author => book.authors_or_unknown().to_string(),
+        }
+    }
+
+    /// Does `book` satisfy a filter set to `want`? Format and language match a
+    /// whole value exactly — they are picked from a fixed menu — while author
+    /// matches a substring, so a fragment of a name narrows the list.
+    fn admits(self, want: &str, book: &Book) -> bool {
+        match self {
+            Facet::Format => book.ext().eq_ignore_ascii_case(want),
+            Facet::Language => book
+                .language
+                .as_deref()
+                .unwrap_or("unknown")
+                .eq_ignore_ascii_case(want),
+            Facet::Author => book
+                .authors_or_unknown()
+                .to_lowercase()
+                .contains(&want.to_lowercase()),
+        }
+    }
+}
+
+/// The pop-over that carves the results by one facet.
+///
+/// It holds the menu of values present — each with the count that choosing it
+/// would leave on screen — and a type-to-narrow line, so picking "epub" or
+/// "Le Guin" is one gesture whether there are three formats or eighty authors.
+/// The list you are aiming at stays on screen the whole time, rather than
+/// flashing past one value per keypress the way the old cycle did.
+struct Picker {
+    facet: Facet,
+    /// The type-to-narrow text, matched case-insensitively as a substring
+    /// against every row's value.
+    query: String,
+    /// Every value present for this facet, most common first — the unfiltered
+    /// menu. Recomputed when the facet changes, not on every keystroke.
+    options: Vec<(String, usize)>,
+    /// Where the highlight sits, as an index into the rows on show: row 0 is
+    /// always "all", the surviving options follow.
+    cursor: usize,
+}
+
+impl Picker {
+    /// The options that survive the type-to-narrow text, in menu order.
+    fn shown(&self) -> Vec<&(String, usize)> {
+        if self.query.trim().is_empty() {
+            return self.options.iter().collect();
+        }
+        let needle = self.query.to_lowercase();
+        self.options
+            .iter()
+            .filter(|(v, _)| v.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Selectable rows: the surviving options plus the leading "all" row.
+    fn rows(&self) -> usize {
+        self.shown().len() + 1
+    }
+
+    /// Where the highlight belongs after the query changes: the first real
+    /// option when the narrowing left any, otherwise the "all" row.
+    fn first_match_row(&self) -> usize {
+        if self.shown().is_empty() { 0 } else { 1 }
+    }
+}
+
 /// The image id used for the cover. Reusing one id means each new cover
 /// replaces the last rather than piling up in the terminal's store.
 const COVER_ID: u32 = 0x636C_6267;
@@ -286,6 +407,13 @@ pub struct App {
     /// Narrow the results to one language, matched exactly against what the
     /// mirror reported.
     lang_filter: Option<String>,
+    /// Narrow the results to authors whose name contains this, matched as a
+    /// case-insensitive substring so part of a name is enough.
+    author_filter: Option<String>,
+    /// The open facet pop-over, when one is up. A modal that carves the results
+    /// by format, language or author — the interactive answer to "epubs only"
+    /// or "just the Le Guin ones" without re-running the search.
+    picker: Option<Picker>,
     /// How the visible list is ordered, and which way. Shared by both tabs and,
     /// like the filters, a standing preference that survives the next search.
     sort: Sort,
@@ -383,6 +511,8 @@ pub fn run(settings: Settings, initial_query: Option<String>) -> Result<()> {
         visible: Vec::new(),
         fmt_filter: None,
         lang_filter: None,
+        author_filter: None,
+        picker: None,
         sort: Sort::Relevance,
         sort_desc: false,
         table: TableState::default(),
@@ -635,32 +765,55 @@ impl App {
     //
     // A search brings back whatever the mirror has — Das Kapital is forty
     // German editions with the English translations scattered among them.
-    // Rather than make people re-search with `lang:` tags, two facets carve
-    // the results in place: `e` cycles through the formats actually present,
-    // `l` through the languages, each shown with a live count of what
-    // choosing it would leave.
+    // Rather than make people re-search with `lang:` tags, three facets carve
+    // the results in place: `e` for format, `l` for language, `a` for author,
+    // each opening a pop-over menu of the values actually present with a live
+    // count of what choosing one would leave.
 
-    /// Does the current pair of filters admit this record?
+    /// The filter value currently set on a facet, if any.
+    fn filter_for(&self, facet: Facet) -> Option<&str> {
+        match facet {
+            Facet::Format => self.fmt_filter.as_deref(),
+            Facet::Language => self.lang_filter.as_deref(),
+            Facet::Author => self.author_filter.as_deref(),
+        }
+    }
+
+    /// Set (or, with `None`, clear) a facet's filter.
+    fn set_filter(&mut self, facet: Facet, value: Option<String>) {
+        match facet {
+            Facet::Format => self.fmt_filter = value,
+            Facet::Language => self.lang_filter = value,
+            Facet::Author => self.author_filter = value,
+        }
+    }
+
+    /// Whether any facet is narrowing the results at all.
+    fn any_filter(&self) -> bool {
+        Facet::ALL.iter().any(|&f| self.filter_for(f).is_some())
+    }
+
+    /// Does every active filter admit this record?
     fn admits(&self, book: &Book) -> bool {
-        self.fmt_admits(book) && self.lang_admits(book)
+        Facet::ALL.iter().all(|&f| self.facet_admits(f, book))
     }
 
-    fn fmt_admits(&self, book: &Book) -> bool {
-        match &self.fmt_filter {
-            Some(want) => book.ext().eq_ignore_ascii_case(want),
+    /// Does the filter on one facet — if it has one — admit this record?
+    fn facet_admits(&self, facet: Facet, book: &Book) -> bool {
+        match self.filter_for(facet) {
+            Some(want) => facet.admits(want, book),
             None => true,
         }
     }
 
-    fn lang_admits(&self, book: &Book) -> bool {
-        match &self.lang_filter {
-            Some(want) => book
-                .language
-                .as_deref()
-                .unwrap_or("unknown")
-                .eq_ignore_ascii_case(want),
-            None => true,
-        }
+    /// Whether `book` survives every filter *except* the one on `facet` — the
+    /// set a facet's own menu counts against, so its numbers say what choosing
+    /// a value would leave once the other facets have had their say.
+    fn admits_except(&self, facet: Facet, book: &Book) -> bool {
+        Facet::ALL
+            .iter()
+            .filter(|&&f| f != facet)
+            .all(|&f| self.facet_admits(f, book))
     }
 
     /// Recompute which rows show, keeping the highlight on the same book when
@@ -736,25 +889,16 @@ impl App {
         self.selection_moved();
     }
 
-    /// The values one facet could take, most common first, each counted with
-    /// the *other* facet still applied — so the numbers say what picking that
-    /// value would actually leave on screen.
-    fn facet_options(&self, format: bool) -> Vec<(String, usize)> {
+    /// The values a facet could take, most common first, each counted with the
+    /// *other* facets still applied — so the numbers say what picking that value
+    /// would actually leave on screen.
+    fn facet_options(&self, facet: Facet) -> Vec<(String, usize)> {
         let mut counts: Vec<(String, usize)> = Vec::new();
         for book in &self.results {
-            let admitted = if format {
-                self.lang_admits(book)
-            } else {
-                self.fmt_admits(book)
-            };
-            if !admitted {
+            if !self.admits_except(facet, book) {
                 continue;
             }
-            let value = if format {
-                book.ext().to_ascii_lowercase()
-            } else {
-                book.language.as_deref().unwrap_or("unknown").to_string()
-            };
+            let value = facet.value_of(book);
             match counts
                 .iter_mut()
                 .find(|(name, _)| name.eq_ignore_ascii_case(&value))
@@ -763,50 +907,74 @@ impl App {
                 None => counts.push((value, 1)),
             }
         }
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
         counts
     }
 
-    /// Step one facet through none → most common → … → back to none.
-    fn cycle_filter(&mut self, format: bool, step: isize) {
-        let options = self.facet_options(format);
-        if options.is_empty() {
+    /// How many records survive once a facet's filter joins the others — the
+    /// number shown beside the active value in the strip.
+    fn facet_count(&self, facet: Facet) -> Option<usize> {
+        self.filter_for(facet)?;
+        Some(
+            self.results
+                .iter()
+                .filter(|b| self.admits_except(facet, b) && self.facet_admits(facet, b))
+                .count(),
+        )
+    }
+
+    /// Raise the pop-over that narrows the results by one facet. There is
+    /// nothing to pick from until a search returns, so it stays shut on an
+    /// empty list. The highlight opens on the value already chosen, if any, so
+    /// reopening a facet lands where it was left.
+    fn open_picker(&mut self, facet: Facet) {
+        if self.results.is_empty() {
             return;
         }
-        let current = if format {
-            self.fmt_filter.as_deref()
-        } else {
-            self.lang_filter.as_deref()
+        let options = self.facet_options(facet);
+        // Open on the value already chosen; with none set, land on the most
+        // common value rather than the "all" row, so "open, Enter" grabs the
+        // obvious pick and clearing is a deliberate step up to "all".
+        let cursor = self
+            .filter_for(facet)
+            .and_then(|cur| options.iter().position(|(n, _)| n.eq_ignore_ascii_case(cur)))
+            .map(|i| i + 1)
+            .unwrap_or(if options.is_empty() { 0 } else { 1 });
+        self.picker = Some(Picker {
+            facet,
+            query: String::new(),
+            options,
+            cursor,
+        });
+    }
+
+    /// Commit whatever the picker is pointing at and close it. The "all" row at
+    /// the top clears the facet; any other row sets it to that value. Typing a
+    /// fragment first is how a value is reached without arrowing — the fragment
+    /// narrows the menu, and the highlight lands on the match it commits.
+    fn apply_picker(&mut self) {
+        let Some(picker) = self.picker.take() else {
+            return;
         };
-        // Position 0 is "no filter"; the options follow in order.
-        let at = current
-            .and_then(|c| options.iter().position(|(n, _)| n.eq_ignore_ascii_case(c)))
-            .map(|i| i as isize + 1)
-            .unwrap_or(0);
-        let next = (at + step).rem_euclid(options.len() as isize + 1);
-        let value = (next > 0).then(|| options[next as usize - 1].0.clone());
-        if format {
-            self.fmt_filter = value;
+        let facet = picker.facet;
+        let value = if picker.cursor == 0 {
+            None
         } else {
-            self.lang_filter = value;
-        }
+            picker.shown().get(picker.cursor - 1).map(|(v, _)| v.clone())
+        };
+        self.set_filter(facet, value);
         self.refine();
     }
 
-    /// The count behind the active choice of one facet, for the filter bar.
-    fn facet_count(&self, format: bool) -> Option<usize> {
-        let current = if format {
-            self.fmt_filter.as_deref()?
-        } else {
-            self.lang_filter.as_deref()?
-        };
-        Some(
-            self.facet_options(format)
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(current))
-                .map(|(_, c)| *c)
-                .unwrap_or(0),
-        )
+    /// Clear every facet at once.
+    fn clear_filters(&mut self) {
+        for facet in Facet::ALL {
+            self.set_filter(facet, None);
+        }
+        self.refine();
     }
 
     /// Note that the selection moved, so a cover becomes due shortly.
@@ -1316,6 +1484,10 @@ impl App {
                 self.marked = vec![false; books.len()];
                 self.table.select(None);
                 self.results = books;
+                // A picker open over the old results is now describing a menu
+                // that no longer exists; close it rather than let it commit a
+                // stale value against the fresh set.
+                self.picker = None;
                 self.refine();
                 self.status = match (self.results.len(), self.visible.len()) {
                     (0, _) => "nothing found — try fewer words".into(),
@@ -1403,6 +1575,12 @@ impl App {
         // Ctrl-C always quits, whatever is on screen.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+        // The facet pop-over is modal: while it is up it takes every key, so a
+        // letter narrows its list rather than leaking out to the results below.
+        if self.picker.is_some() {
+            self.on_key_picker(key);
             return;
         }
         // Switching tabs works from everywhere, including mid-typing. The
@@ -1517,7 +1695,7 @@ impl App {
                 }
                 self.move_by(1);
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('A') => {
                 // "Everything" means everything showing: filters carve the
                 // batch too, which is the whole point of them.
                 let all = self
@@ -1530,15 +1708,10 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('e') => self.cycle_filter(true, 1),
-            KeyCode::Char('E') => self.cycle_filter(true, -1),
-            KeyCode::Char('l') => self.cycle_filter(false, 1),
-            KeyCode::Char('L') => self.cycle_filter(false, -1),
-            KeyCode::Char('x') if self.fmt_filter.is_some() || self.lang_filter.is_some() => {
-                self.fmt_filter = None;
-                self.lang_filter = None;
-                self.refine();
-            }
+            KeyCode::Char('e') => self.open_picker(Facet::Format),
+            KeyCode::Char('l') => self.open_picker(Facet::Language),
+            KeyCode::Char('a') => self.open_picker(Facet::Author),
+            KeyCode::Char('x') if self.any_filter() => self.clear_filters(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.reverse_sort(),
             KeyCode::Char('y') => self.yank_md5(),
@@ -1547,6 +1720,64 @@ impl App {
             KeyCode::Char('m') => self.spawn_mirror_resolve(true),
             KeyCode::Char('o') => self.launch_result(false),
             KeyCode::Char('f') => self.launch_result(true),
+            _ => {}
+        }
+    }
+
+    /// Keys while the facet pop-over is up. Letters type into its narrow line;
+    /// the arrows (and Ctrl-N/P, so the home row keeps typing) walk the menu;
+    /// Tab rotates to the next facet without leaving the overlay; Enter commits
+    /// and Esc backs out leaving the results as they were.
+    fn on_key_picker(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // These need `self` whole — a facet switch recomputes the menu, apply
+        // re-sorts the results — so they run before the mutable borrow below.
+        match key.code {
+            KeyCode::Esc => {
+                self.picker = None;
+                return;
+            }
+            KeyCode::Enter => {
+                self.apply_picker();
+                return;
+            }
+            KeyCode::Tab => {
+                if let Some(next) = self.picker.as_ref().map(|p| p.facet.next()) {
+                    self.open_picker(next);
+                }
+                return;
+            }
+            KeyCode::BackTab => {
+                if let Some(prev) = self.picker.as_ref().map(|p| p.facet.prev()) {
+                    self.open_picker(prev);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let last = picker.rows() - 1;
+        match key.code {
+            KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Char('p') if ctrl => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down => picker.cursor = (picker.cursor + 1).min(last),
+            KeyCode::Char('n') if ctrl => picker.cursor = (picker.cursor + 1).min(last),
+            KeyCode::Home => picker.cursor = 0,
+            KeyCode::End => picker.cursor = last,
+            KeyCode::Char('u') if ctrl => {
+                picker.query.clear();
+                picker.cursor = 0;
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.cursor = picker.first_match_row();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                picker.query.push(c);
+                picker.cursor = picker.first_match_row();
+            }
             _ => {}
         }
     }
@@ -1752,12 +1983,15 @@ impl App {
         if self.mode == Mode::Help {
             self.render_help(frame);
         }
+        if self.picker.is_some() {
+            self.render_picker(frame);
+        }
     }
 
-    /// The refinement bar: the two facets and what they leave showing.
+    /// The refinement bar: the three facets and what they leave showing.
     ///
     /// It lives on its own row, under the search box, so the counts update in
-    /// place as `e` and `l` cycle — filters you can watch working, rather than
+    /// place as a facet is picked — filters you can watch working, rather than
     /// tags you have to re-type into a new search.
     /// The sort indicator for the control strip: the key that cycles it, the
     /// active order, and a caret for the direction — dropped for `Relevance`,
@@ -1794,8 +2028,6 @@ impl App {
         if area.height == 0 {
             return;
         }
-        let filtered = self.fmt_filter.is_some() || self.lang_filter.is_some();
-
         // Right side first: the sort, then either what a marked batch would
         // pull, or how much of the catch is on screen. Amber comes out only
         // when something is being narrowed or gathered.
@@ -1825,42 +2057,177 @@ impl App {
             area,
         );
 
-        let key = |k: &str| {
+        let key = |k: char| {
             Span::styled(k.to_string(), theme::accent().add_modifier(Modifier::BOLD))
         };
         let label = |l: &str| Span::styled(format!(" {l} "), theme::faint());
 
-        let mut spans = vec![Span::raw(" "), key("e"), label("format")];
-        match &self.fmt_filter {
-            Some(f) => {
-                spans.push(Span::styled(format!(" {f} "), theme::format_chip(f)));
-                if let Some(n) = self.facet_count(true) {
-                    spans.push(Span::styled(format!(" {n}"), theme::faint()));
-                }
+        // The three facets, each showing its active value with a count of what
+        // it leaves — or a muted "all" when it is not narrowing anything.
+        let mut spans = vec![Span::raw(" ")];
+        for (n, &facet) in Facet::ALL.iter().enumerate() {
+            if n > 0 {
+                spans.push(Span::raw("   "));
             }
-            None => spans.push(Span::styled("all", theme::muted())),
-        }
-        spans.push(Span::raw("    "));
-        spans.push(key("l"));
-        spans.push(label("language"));
-        match &self.lang_filter {
-            Some(l) => {
-                spans.push(Span::styled(
-                    l.clone(),
-                    Style::new().fg(theme::LANG).add_modifier(Modifier::BOLD),
-                ));
-                if let Some(n) = self.facet_count(false) {
-                    spans.push(Span::styled(format!(" {n}"), theme::faint()));
+            spans.push(key(facet.key()));
+            spans.push(label(facet.label()));
+            match self.filter_for(facet) {
+                Some(value) => {
+                    spans.push(facet_value_span(facet, value));
+                    if let Some(c) = self.facet_count(facet) {
+                        spans.push(Span::styled(format!(" {c}"), theme::faint()));
+                    }
                 }
+                None => spans.push(Span::styled("all", theme::muted())),
             }
-            None => spans.push(Span::styled("all", theme::muted())),
         }
-        if filtered {
-            spans.push(Span::raw("    "));
-            spans.push(key("x"));
+        if self.any_filter() {
+            spans.push(Span::raw("   "));
+            spans.push(key('x'));
             spans.push(label("clear"));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The facet pop-over: a narrow line you type into and a menu of the values
+    /// present, each with the count picking it would leave. It floats over the
+    /// results rather than replacing them, so the list you are carving stays in
+    /// view — and a search that returned eighty authors is one substring away
+    /// from the one you want, not eighty presses of a cycle key.
+    fn render_picker(&self, frame: &mut Frame) {
+        let Some(picker) = &self.picker else {
+            return;
+        };
+        let facet = picker.facet;
+        let shown = picker.shown();
+
+        // The "all" row plus one per surviving option, capped so the overlay
+        // never grows past a comfortable slice of the screen.
+        let want_rows = shown.len() + 1;
+        let screen = frame.area();
+        let max_list = (screen.height.saturating_sub(9)).clamp(3, 16) as usize;
+        let list_rows = want_rows.min(max_list);
+        // input(1) + rule(1) + list + footer(1), plus the border's two rows.
+        let height = (list_rows as u16 + 5).min(screen.height.saturating_sub(2));
+        let width = 52u16.min(screen.width.saturating_sub(4));
+        let area = centered(screen, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(theme::ACCENT))
+            .style(Style::new().bg(theme::BG_ALT))
+            .title(Span::styled(
+                format!(" filter · {} ", facet.label()),
+                Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let rows = Layout::vertical([
+            Constraint::Length(1), // the type-to-narrow line
+            Constraint::Length(1), // a faint rule
+            Constraint::Min(1),    // the menu
+            Constraint::Length(1), // the key legend
+        ])
+        .split(inner);
+
+        // The narrow line, with a live "n of m" once it is doing anything.
+        let mut top = vec![Span::styled(
+            "❯ ",
+            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        )];
+        if picker.query.is_empty() {
+            top.push(Span::styled("type to narrow", theme::faint()));
+        } else {
+            top.push(Span::styled(picker.query.clone(), theme::text()));
+            top.push(Span::styled("▏", theme::accent()));
+        }
+        let mut top_line = Paragraph::new(Line::from(top));
+        if !picker.query.is_empty() {
+            let count = Line::from(Span::styled(
+                format!("{} of {} ", shown.len(), picker.options.len()),
+                theme::faint(),
+            ));
+            frame.render_widget(Paragraph::new(count).alignment(Alignment::Right), rows[0]);
+        }
+        top_line = top_line.style(Style::new().bg(theme::BG_ALT));
+        frame.render_widget(top_line, rows[0]);
+        frame.render_widget(
+            Paragraph::new("─".repeat(rows[1].width as usize)).style(theme::faint()),
+            rows[1],
+        );
+
+        // Keep the highlight in view by scrolling the menu under it.
+        let cap = rows[2].height as usize;
+        let total = shown.len() + 1;
+        let offset = if picker.cursor >= cap {
+            (picker.cursor - cap + 1).min(total.saturating_sub(cap))
+        } else {
+            0
+        };
+
+        let active = self.filter_for(facet);
+        let mut lines: Vec<Line> = Vec::new();
+        for row in offset..(offset + cap).min(total) {
+            let selected = row == picker.cursor;
+            let gutter = if selected {
+                Span::styled(theme::CURSOR, theme::accent())
+            } else {
+                Span::raw("  ")
+            };
+            let mut spans = vec![gutter];
+            if row == 0 {
+                // The clearing row. It carries a mark when nothing is filtered,
+                // so "all" reads as the current state and not just an option.
+                let on = active.is_none();
+                spans.push(Span::styled(
+                    if on { "● " } else { "  " },
+                    theme::accent(),
+                ));
+                spans.push(Span::styled(
+                    "all",
+                    if on {
+                        theme::text().add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::muted()
+                    },
+                ));
+                spans.push(Span::styled("  clear filter", theme::faint()));
+            } else {
+                let (value, count) = shown[row - 1];
+                let on = active.is_some_and(|a| a.eq_ignore_ascii_case(value));
+                spans.push(Span::styled(if on { "● " } else { "  " }, theme::accent()));
+                spans.push(facet_value_span(facet, value));
+                spans.push(Span::styled(format!("  {count}"), theme::faint()));
+            }
+            let mut line = Line::from(spans);
+            if selected {
+                line = line.style(theme::selected_row());
+            }
+            lines.push(line);
+        }
+        frame.render_widget(Paragraph::new(lines), rows[2]);
+
+        let legend = |k: &str, l: &str| {
+            [
+                Span::styled(
+                    format!("{k} "),
+                    theme::accent().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{l}   "), theme::faint()),
+            ]
+        };
+        let footer: Vec<Span> = [
+            legend("⏎", "choose"),
+            legend("↑↓", "move"),
+            legend("⇥", "facet"),
+            legend("esc", "close"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        frame.render_widget(Paragraph::new(Line::from(footer)), rows[3]);
     }
 
     /// The Library tab's control strip: the sort on the right, and on the left
@@ -2191,13 +2558,10 @@ impl App {
         // Results exist but the filters admit none of them — say which lever
         // to pull, not just "nothing here".
         if !self.results.is_empty() {
-            let mut carved = Vec::new();
-            if let Some(f) = &self.fmt_filter {
-                carved.push(f.clone());
-            }
-            if let Some(l) = &self.lang_filter {
-                carved.push(l.clone());
-            }
+            let carved: Vec<String> = Facet::ALL
+                .iter()
+                .filter_map(|&f| self.filter_for(f).map(str::to_string))
+                .collect();
             let lines = vec![
                 Line::from(Span::styled(
                     format!(
@@ -2211,8 +2575,8 @@ impl App {
                 Line::from(vec![
                     Span::styled("x", theme::accent().add_modifier(Modifier::BOLD)),
                     Span::styled(" clears the filters   ", theme::faint()),
-                    Span::styled("e l", theme::accent().add_modifier(Modifier::BOLD)),
-                    Span::styled(" cycle them", theme::faint()),
+                    Span::styled("e l a", theme::accent().add_modifier(Modifier::BOLD)),
+                    Span::styled(" adjust them", theme::faint()),
                 ]),
             ];
             let block = area.inner(Margin {
@@ -2952,7 +3316,8 @@ impl App {
                 ("space", "mark"),
                 ("⏎", "download"),
                 ("e", "format"),
-                ("l", "language"),
+                ("l", "lang"),
+                ("a", "author"),
                 ("s", "sort"),
                 ("/", "search"),
                 ("?", "help"),
@@ -3010,11 +3375,11 @@ impl App {
                 "search tab",
                 &[
                     ("⏎", "run the search, or download the selection"),
-                    ("e  E", "cycle the format filter, e.g. epub only"),
-                    ("l  L", "cycle the language filter"),
-                    ("x", "clear both filters"),
+                    ("e  l  a", "filter by format / language / author"),
+                    ("", "  a menu: type to narrow, ⏎ to choose"),
+                    ("x", "clear every filter"),
                     ("space", "mark a result for batch download"),
-                    ("a", "mark or unmark everything showing"),
+                    ("A", "mark or unmark everything showing"),
                     ("o  f", "open a downloaded result / reveal it"),
                     ("r", "run the search again"),
                     ("m", "re-probe mirrors and pick a new one"),
@@ -3121,6 +3486,34 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+/// A facet's value dressed in its own colour, the same one it wears in the
+/// results: a format as a solid chip, a language in its calm blue, an author in
+/// plain bold text (clipped, since author strings run long). Used by both the
+/// strip and the picker so a value looks the same wherever it is shown.
+fn facet_value_span(facet: Facet, value: &str) -> Span<'static> {
+    match facet {
+        Facet::Format => Span::styled(format!(" {value} "), theme::format_chip(value)),
+        Facet::Language => Span::styled(
+            value.to_string(),
+            Style::new().fg(theme::LANG).add_modifier(Modifier::BOLD),
+        ),
+        Facet::Author => Span::styled(
+            clip(value, 30),
+            theme::text().add_modifier(Modifier::BOLD),
+        ),
+    }
+}
+
+/// Shorten `s` to at most `max` characters, ending in an ellipsis when cut, so
+/// a long author string cannot push a row off the edge of its box.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// The first of several semicolon-separated authors, lowercased for sorting
@@ -3308,6 +3701,8 @@ mod tests {
             visible: Vec::new(),
             fmt_filter: None,
             lang_filter: None,
+            author_filter: None,
+            picker: None,
             sort: Sort::Relevance,
             sort_desc: false,
             table: TableState::default(),
@@ -3339,6 +3734,17 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Drive the facet picker the way a person would: its key opens the menu,
+    /// the typed text narrows it, and Enter commits the highlighted row (the
+    /// first match once anything is typed).
+    fn pick(app: &mut App, facet_key: char, query: &str) {
+        press(app, KeyCode::Char(facet_key));
+        for c in query.chars() {
+            press(app, KeyCode::Char(c));
+        }
+        press(app, KeyCode::Enter);
     }
 
     fn books(n: usize) -> Vec<Book> {
@@ -3483,13 +3889,13 @@ mod tests {
     }
 
     #[test]
-    fn a_toggles_every_mark() {
+    fn capital_a_toggles_every_mark() {
         let mut a = app();
         a.mode = Mode::Browsing;
         install(&mut a, books(3));
-        press(&mut a, KeyCode::Char('a'));
+        press(&mut a, KeyCode::Char('A'));
         assert_eq!(a.marked, [true, true, true]);
-        press(&mut a, KeyCode::Char('a'));
+        press(&mut a, KeyCode::Char('A'));
         assert_eq!(a.marked, [false, false, false]);
     }
 
@@ -3762,6 +4168,45 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_picker_lists_the_values_present_with_counts() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        press(&mut a, KeyCode::Char('a')); // author picker
+        let screen = draw(&mut a, 100, 30);
+        assert!(screen.contains("filter · author"), "{screen}");
+        assert!(screen.contains("clear filter"), "{screen}");
+        // Every author present, most common first, each with its count.
+        assert!(screen.contains("Marx, Karl"), "{screen}");
+        assert!(screen.contains("Le Guin, Ursula"), "{screen}");
+        assert!(screen.contains("choose"), "the key legend is shown: {screen}");
+
+        // Typing narrows the menu in place rather than cycling values past:
+        // "guin" leaves one of the three authors on the menu.
+        for c in "guin".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        let screen = draw(&mut a, 100, 30);
+        assert!(screen.contains("Le Guin, Ursula"), "{screen}");
+        assert!(screen.contains("1 of 3"), "the live match count: {screen}");
+    }
+
+    #[test]
+    fn tab_rotates_the_open_picker_between_facets() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        press(&mut a, KeyCode::Char('e'));
+        assert_eq!(a.picker.as_ref().map(|p| p.facet), Some(Facet::Format));
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.picker.as_ref().map(|p| p.facet), Some(Facet::Language));
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.picker.as_ref().map(|p| p.facet), Some(Facet::Author));
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.picker.as_ref().map(|p| p.facet), Some(Facet::Format), "wraps");
     }
 
     #[test]
@@ -4285,64 +4730,120 @@ mod tests {
     }
 
     /// A result set shaped like the Das Kapital problem: one work, many
-    /// languages and formats mixed together.
+    /// languages, formats and authors mixed together.
     fn polyglot() -> Vec<Book> {
-        let entry = |i: usize, lang: &str, ext: &str| Book {
+        let entry = |i: usize, lang: &str, ext: &str, author: &str| Book {
             md5: format!("{i:032x}"),
             title: format!("Das Kapital {i}"),
             language: Some(lang.into()),
             extension: Some(ext.into()),
+            authors: Some(author.into()),
             ..Default::default()
         };
         vec![
-            entry(0, "German", "pdf"),
-            entry(1, "German", "epub"),
-            entry(2, "English", "epub"),
-            entry(3, "German", "pdf"),
-            entry(4, "English", "pdf"),
-            entry(5, "Spanish", "djvu"),
+            entry(0, "German", "pdf", "Marx, Karl"),
+            entry(1, "German", "epub", "Marx, Karl"),
+            entry(2, "English", "epub", "Le Guin, Ursula"),
+            entry(3, "German", "pdf", "Marx, Karl"),
+            entry(4, "English", "pdf", "Engels, Friedrich"),
+            entry(5, "Spanish", "djvu", "Le Guin, Ursula"),
         ]
     }
 
     #[test]
-    fn cycling_the_language_filter_narrows_the_results() {
+    fn the_language_picker_narrows_the_results() {
         let mut a = app();
         a.mode = Mode::Browsing;
         install(&mut a, polyglot());
         assert_eq!(a.visible.len(), 6);
 
-        // Options come most-common-first, so one press lands on German…
-        press(&mut a, KeyCode::Char('l'));
-        assert_eq!(a.lang_filter.as_deref(), Some("German"));
-        assert_eq!(a.visible.len(), 3);
-
-        // …and the next lands on English: the whole point of the feature.
-        press(&mut a, KeyCode::Char('l'));
+        // One gesture reaches any value: open, type a fragment, Enter — no
+        // stepping through the languages in between.
+        pick(&mut a, 'l', "english");
         assert_eq!(a.lang_filter.as_deref(), Some("English"));
         assert_eq!(a.visible.len(), 2);
         assert!(a.visible.iter().all(|&i| a.results[i].language.as_deref() == Some("English")));
 
-        // Cycling past the end returns to everything.
-        press(&mut a, KeyCode::Char('l')); // Spanish
-        press(&mut a, KeyCode::Char('l')); // back to all
+        // Reopen and take the "all" row at the top to clear it.
+        press(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Home);
+        press(&mut a, KeyCode::Enter);
         assert_eq!(a.lang_filter, None);
         assert_eq!(a.visible.len(), 6);
     }
 
     #[test]
-    fn the_two_filters_compose_and_x_clears_them() {
+    fn open_then_enter_takes_the_most_common_value() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        // No filter set yet: the highlight opens on the top value, so the
+        // quickest gesture — open, Enter — grabs the obvious pick.
+        press(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.lang_filter.as_deref(), Some("German"));
+        assert_eq!(a.visible.len(), 3);
+    }
+
+    #[test]
+    fn opening_a_picker_does_not_leak_keys_to_the_list() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        press(&mut a, KeyCode::Char('l')); // picker up
+        assert!(a.picker.is_some());
+        // A letter narrows the menu; it must not also start a search or move
+        // the list underneath.
+        press(&mut a, KeyCode::Char('g'));
+        assert_eq!(a.picker.as_ref().unwrap().query, "g");
+        press(&mut a, KeyCode::Esc);
+        assert!(a.picker.is_none());
+        assert_eq!(a.lang_filter, None, "esc backs out without applying");
+    }
+
+    #[test]
+    fn the_author_picker_filters_by_name() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        // Three editions are Marx's; a fragment of the name is enough.
+        pick(&mut a, 'a', "marx");
+        assert_eq!(a.author_filter.as_deref(), Some("Marx, Karl"));
+        assert_eq!(a.visible.len(), 3);
+        assert!(a.visible.iter().all(|&i| a.results[i]
+            .authors
+            .as_deref()
+            .unwrap()
+            .contains("Marx")));
+    }
+
+    #[test]
+    fn an_author_fragment_reaches_the_full_name() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, polyglot());
+        // "guin" is only part of the listed "Le Guin, Ursula", but typing it
+        // narrows the menu to that one row and Enter commits the whole value —
+        // which then matches both Le Guin editions.
+        pick(&mut a, 'a', "guin");
+        assert_eq!(a.author_filter.as_deref(), Some("Le Guin, Ursula"));
+        assert_eq!(a.visible.len(), 2);
+    }
+
+    #[test]
+    fn the_three_filters_compose_and_x_clears_them() {
         let mut a = app();
         a.mode = Mode::Browsing;
         install(&mut a, polyglot());
 
-        press(&mut a, KeyCode::Char('l')); // German (most common)
-        press(&mut a, KeyCode::Char('e')); // pdf (most common among German)
+        pick(&mut a, 'l', "german");
+        pick(&mut a, 'e', "pdf");
+        pick(&mut a, 'a', "marx");
         assert_eq!(a.fmt_filter.as_deref(), Some("pdf"));
-        assert_eq!(a.visible.len(), 2, "German pdfs only");
+        assert_eq!(a.visible.len(), 2, "German Marx pdfs only");
 
         press(&mut a, KeyCode::Char('x'));
-        assert_eq!(a.fmt_filter, None);
-        assert_eq!(a.lang_filter, None);
+        assert!(!a.any_filter());
         assert_eq!(a.visible.len(), 6);
     }
 
@@ -4353,7 +4854,7 @@ mod tests {
         a.lang_filter = Some("English".into());
         a.refine();
         // With English active there is 1 epub and 1 pdf to offer, not 2 and 3.
-        let formats = a.facet_options(true);
+        let formats = a.facet_options(Facet::Format);
         assert!(formats.iter().all(|(_, n)| *n == 1), "{formats:?}");
     }
 
@@ -4362,8 +4863,7 @@ mod tests {
         let mut a = app();
         a.mode = Mode::Browsing;
         install(&mut a, polyglot());
-        press(&mut a, KeyCode::Char('l'));
-        press(&mut a, KeyCode::Char('l'));
+        pick(&mut a, 'l', "english");
         assert_eq!(a.lang_filter.as_deref(), Some("English"));
 
         a.handle(Ev::Results(Ok((polyglot(), "libgen.li".into()))));
@@ -4377,8 +4877,7 @@ mod tests {
         let mut a = app();
         a.mode = Mode::Browsing;
         install(&mut a, polyglot());
-        press(&mut a, KeyCode::Char('l'));
-        press(&mut a, KeyCode::Char('l')); // English: results 2 and 4
+        pick(&mut a, 'l', "english"); // English: results 2 and 4
 
         assert_eq!(a.selected().map(|b| b.md5.clone()).as_deref(), Some("00000000000000000000000000000002"));
         press(&mut a, KeyCode::Down);
@@ -4386,8 +4885,8 @@ mod tests {
         press(&mut a, KeyCode::Down);
         assert_eq!(a.table.selected(), Some(1), "two rows showing, no further");
 
-        // `a` marks only what is showing.
-        press(&mut a, KeyCode::Char('a'));
+        // `A` marks only what is showing.
+        press(&mut a, KeyCode::Char('A'));
         assert_eq!(a.marked, [false, false, true, false, true, false]);
     }
 
@@ -4401,7 +4900,7 @@ mod tests {
         for _ in 0..4 {
             press(&mut a, KeyCode::Down);
         }
-        press(&mut a, KeyCode::Char('e')); // pdf, the most common format
+        pick(&mut a, 'e', "pdf");
         assert_eq!(a.fmt_filter.as_deref(), Some("pdf"));
         assert_eq!(
             a.selected().map(|b| b.md5.clone()).as_deref(),
@@ -4420,9 +4919,9 @@ mod tests {
         assert!(screen.contains("6 results"), "{screen}");
         assert!(screen.contains("format"), "{screen}");
         assert!(screen.contains("language"), "{screen}");
+        assert!(screen.contains("author"), "{screen}");
 
-        press(&mut a, KeyCode::Char('l'));
-        press(&mut a, KeyCode::Char('l'));
+        pick(&mut a, 'l', "english");
         let screen = draw(&mut a, 100, 24);
         assert!(screen.contains("English"), "{screen}");
         assert!(screen.contains("2 of 6 shown"), "{screen}");
