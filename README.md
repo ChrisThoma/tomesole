@@ -30,11 +30,11 @@ books you already have, and **Settings**. `Tab` cycles through them, `1`/`2`/`3`
 jumps straight to one, and `?` shows every key.
 
 ```
-╭  1 SEARCH    2 LIBRARY 12    3 SETTINGS  ────────────────── ● libgen.li ╮
+╭  1 SEARCH    2 LIBRARY    3 SETTINGS  ───────────────────── ● libgen.li ╮
 │❯ dune                                                                   │
 ╰─────────────────────────────────────────────────────────────────────────╯
- e format all   l language English 6   a author all   x clear   s sort year ▼
-   TITLE                AUTHOR         YEAR LANG     SIZE   FMT  STATUS ╭──╮
+ e format all   l language English 6   a author all   x clear    sort: year ▼
+   TITLE                AUTHOR         YEAR LANG    SIZE   FMT  STATUS ╭──╮
 ▌  Dune                 Frank Herbert  1965 English 781 KB epub library│▄▄│
    Dune Messiah         Frank Herbert  1969 English 922 KB epub        │██│
    Children of Dune     Frank Herbert  1976 English 1.1 MB pdf         │▀▀│

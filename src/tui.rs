@@ -2813,9 +2813,10 @@ impl App {
     /// It lives on its own row, under the search box, so the counts update in
     /// place as a facet is picked — filters you can watch working, rather than
     /// tags you have to re-type into a new search.
-    /// The sort indicator for the control strip: the key that cycles it, the
-    /// active order, and a caret for the direction — dropped for `Relevance`,
-    /// which is the list's own order and has no up or down.
+    /// The sort indicator for the control strip: the active order and a caret
+    /// for the direction — dropped for `Relevance`, which is the list's own
+    /// order and has no up or down. State only; the `s` key that cycles it
+    /// lives in the hint row like every other binding.
     fn sort_indicator(&self) -> Vec<Span<'static>> {
         let caret = match (self.sort, self.sort_desc) {
             (Sort::Relevance, _) => "",
@@ -2823,10 +2824,11 @@ impl App {
             (_, false) => " ▲",
         };
         vec![
-            Span::styled("s", theme::accent().add_modifier(Modifier::BOLD)),
-            Span::styled(" sort ", theme::faint()),
-            Span::styled(self.sort.label(self.tab).to_string(), theme::muted()),
-            Span::styled(caret.to_string(), Style::new().fg(theme::AMBER)),
+            Span::styled("sort: ", theme::faint()),
+            Span::styled(
+                format!("{}{caret}", self.sort.label(self.tab)),
+                theme::muted(),
+            ),
         ]
     }
 
@@ -2852,7 +2854,7 @@ impl App {
         // pull, or how much of the catch is on screen. Amber comes out only
         // when something is being narrowed or gathered.
         let mut right = self.sort_indicator();
-        right.push(Span::styled("     ", theme::faint()));
+        right.push(Span::styled("  ·  ", theme::faint()));
         match self.marked_summary() {
             Some((n, bytes)) => {
                 let amber = Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD);
@@ -3149,7 +3151,7 @@ impl App {
         // Right: the sort, and the filter count when a filter is hiding books.
         let mut right = self.sort_indicator();
         if !self.filter.trim().is_empty() {
-            right.push(Span::styled("     ", theme::faint()));
+            right.push(Span::styled("  ·  ", theme::faint()));
             right.push(Span::styled(
                 format!("{} of {} shown ", self.shown.len(), self.library.len()),
                 Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD),
@@ -3176,9 +3178,9 @@ impl App {
             spans.push(Span::styled(format!("  ·  {}", human_bytes(total)), theme::faint()));
         }
         for (ext, n) in self.format_breakdown().into_iter().take(4) {
-            spans.push(Span::styled("    ", theme::faint()));
-            spans.push(Span::styled(format!("{n} "), theme::faint()));
+            spans.push(Span::styled("  ·  ", theme::faint()));
             spans.push(Span::styled(ext.clone(), Style::new().fg(theme::format_color(&ext))));
+            spans.push(Span::styled(format!(" {n}"), theme::faint()));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -3930,10 +3932,24 @@ impl App {
         };
 
         let verified = if entry.verified {
-            Span::styled("✓ MD5 verified", Style::new().fg(theme::SUCCESS))
+            Span::styled("✓ verified", Style::new().fg(theme::SUCCESS))
         } else {
             Span::styled("unverified", theme::faint())
         };
+        // One metadata line, dot-separated throughout — except after the format
+        // chip, whose background wants a little clear air instead of a glued
+        // dot. The date is relative and labelled, matching the ADDED column.
+        let mut meta = vec![
+            Span::styled(format!(" {} ", entry.ext()), theme::format_chip(entry.ext())),
+            Span::styled(format!("  {}", human_bytes(entry.size)), theme::muted()),
+        ];
+        let added = history::when(entry.at, history::now());
+        if !added.is_empty() {
+            meta.push(Span::styled(format!("  ·  added {added}"), theme::muted()));
+        }
+        meta.push(Span::styled("  ·  ", theme::muted()));
+        meta.push(verified);
+
         let mut lines = vec![
             Line::from(Span::styled(
                 entry.title.clone(),
@@ -3943,37 +3959,22 @@ impl App {
                 entry.authors.clone().unwrap_or_default(),
                 theme::muted(),
             )),
-            Line::from(Span::styled(entry.path.display().to_string(), theme::faint())),
-            Line::from(vec![
-                Span::styled(format!(" {} ", entry.ext()), theme::format_chip(entry.ext())),
-                Span::styled(
-                    format!(
-                        "  {}  ·  {}  ·  ",
-                        human_bytes(entry.size),
-                        history::timestamp(entry.at),
-                    ),
-                    theme::muted(),
-                ),
-                verified,
-            ]),
-            Line::from(""),
+            Line::from(meta),
+            Line::from(Span::styled(tilde_path(&entry.path), theme::faint())),
         ];
 
         if let Some(error) = &self.error {
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 error.clone(),
                 Style::new().fg(theme::DANGER),
             )));
         } else if !entry.present() {
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "⚠ the file is no longer there — press d to forget it",
                 Style::new().fg(theme::DANGER),
             )));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("⏎ open", theme::accent()),
-                Span::styled("   f reveal in file manager", theme::faint()),
-            ]));
         }
 
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
@@ -3982,13 +3983,9 @@ impl App {
     /// The row of tab chips shown as the box title on every tab: the active one
     /// a solid accent chip, the rest faint.
     fn tab_chips(&self) -> Vec<Span<'static>> {
-        fn chip(label: &str, count: Option<usize>, active: bool) -> Span<'static> {
-            let text = match count {
-                Some(n) => format!("  {label} {n}  "),
-                None => format!("  {label}  "),
-            };
+        fn chip(label: &str, active: bool) -> Span<'static> {
             Span::styled(
-                text,
+                format!("  {label}  "),
                 if active {
                     // Colour and reverse together, so the active chip is
                     // unmistakable even without truecolour.
@@ -4002,11 +3999,11 @@ impl App {
             )
         }
         vec![
-            chip("1 SEARCH", None, self.tab == Tab::Search),
+            chip("1 SEARCH", self.tab == Tab::Search),
             Span::raw(" "),
-            chip("2 LIBRARY", Some(self.library.len()), self.tab == Tab::Library),
+            chip("2 LIBRARY", self.tab == Tab::Library),
             Span::raw(" "),
-            chip("3 SETTINGS", None, self.tab == Tab::Settings),
+            chip("3 SETTINGS", self.tab == Tab::Settings),
         ]
     }
 
@@ -4212,7 +4209,6 @@ impl App {
                 ("f", "reveal"),
                 ("s", "sort"),
                 ("/", "filter"),
-                ("d", "forget"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -4461,6 +4457,15 @@ fn clip(s: &str, max: usize) -> String {
     }
     let head: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{head}…")
+}
+
+/// A path with the home directory collapsed to `~` — shorter, and it says
+/// nothing about the username.
+fn tilde_path(path: &std::path::Path) -> String {
+    match path.strip_prefix(crate::config::home_dir()) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 /// The first of several semicolon-separated authors, lowercased for sorting
@@ -5928,8 +5933,12 @@ mod tests {
         let screen = draw(&mut a, 100, 24);
         assert!(screen.contains("SEARCH"), "{screen}");
         assert!(screen.contains("LIBRARY"), "{screen}");
-        // The count rides along in the tab label so it is visible before you go.
-        assert!(screen.contains("LIBRARY 4"), "{screen}");
+        // The chip is pure navigation; the count lives in the library strip.
+        assert!(!screen.contains("LIBRARY 4"), "{screen}");
+        a.tab = Tab::Library;
+        with_library(&mut a, entries(4));
+        let screen = draw(&mut a, 100, 24);
+        assert!(screen.contains("4 books"), "{screen}");
     }
 
     #[test]
