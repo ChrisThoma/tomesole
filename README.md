@@ -1,5 +1,10 @@
 # tomesole
 
+[![CI](https://github.com/ChrisThoma/tomesole/actions/workflows/ci.yml/badge.svg)](https://github.com/ChrisThoma/tomesole/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/tomesole.svg)](https://crates.io/crates/tomesole)
+[![release](https://img.shields.io/github/v/release/ChrisThoma/tomesole)](https://github.com/ChrisThoma/tomesole/releases/latest)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A terminal client for searching and downloading from Library Genesis, with both
 a full-screen interface and a scriptable CLI.
 
