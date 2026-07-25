@@ -9,6 +9,9 @@ repository = "https://github.com/ChrisThoma/tomesole"
 homepage = "https://individuation.dev/projects/tomesole/"
 keywords = ["libgen", "library-genesis", "ebooks", "tui", "cli"]
 categories = ["command-line-utilities"]
+# The demo GIF is a megabyte of README decoration. It lives in the repo and the
+# README points at it there, so there is no reason to ship it in the .crate.
+exclude = ["docs/"]
 
 # Kept deliberately small. Only three things here are genuinely not worth
 # hand-rolling: TLS (ureq/rustls), and the OS extended-attribute call used to
