@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<!-- Source for docs/social.png (1200x630). Regenerate with:
+     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --disable-gpu \
+       --screenshot=docs/social.png --window-size=1200,630 --hide-scrollbars "file://$PWD/docs/social-card.html"
+     The wordmark must stay in sync with WORDMARK in src/tui.rs. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1200px; height: 630px; overflow: hidden; }
+  body {
+    background: #0d1119;
+    font-family: "SF Mono", Menlo, Monaco, monospace;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .frame {
+    width: 1104px; height: 534px;
+    border: 2px solid rgba(58, 232, 219, 0.28);
+    border-radius: 18px;
+    background: #0e131d;
+    box-shadow: 0 0 60px rgba(58, 232, 219, 0.06) inset;
+    display: flex; flex-direction: column;
+  }
+  .tabs {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 22px 34px 18px;
+    border-bottom: 1px solid rgba(58, 232, 219, 0.14);
+    font-size: 19px; letter-spacing: 0.5px;
+  }
+  .tabs .left { display: flex; }
+  .tabs .on  { color: #3ae8db; }
+  .tabs .num { color: #ffc55c; }
+  .tabs .off { color: #8b96ac; }
+  .tabs .left > span + span { margin-left: 14px; }
+  .mirror { color: #bac4d6; font-size: 19px; }
+  .dot { color: #66e791; margin-right: 8px; }
+  .stage {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding-bottom: 10px;
+  }
+  pre.wordmark {
+    font-size: 21px; line-height: 0.99;
+    color: #3ae8db;
+    text-shadow: 0 0 26px rgba(58, 232, 219, 0.55), 0 0 4px rgba(58, 232, 219, 0.35);
+    margin-bottom: 40px;
+  }
+  .tagline { font-size: 30px; color: #f1f5fb; margin-bottom: 20px; }
+  .tagline b { color: #ffc55c; font-weight: 600; }
+  .sub { font-size: 21px; color: #8b96ac; margin-bottom: 40px; }
+  .pills { display: flex; align-items: center; font-size: 19px; }
+  .pill {
+    padding: 4px 14px; border-radius: 7px; margin-right: 14px;
+    color: #0d1119; font-weight: 700;
+  }
+  .epub { background: #58e28c; }
+  .pdf  { background: #ff7e6e; }
+  .mobi { background: #fabe50; }
+  .djvu { background: #c496ff; }
+  .pills i { font-style: normal; color: #8b96ac; margin-left: 8px; }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="tabs">
+      <div class="left">
+        <span class="on"><span class="num">1</span> SEARCH</span>
+        <span class="off"><span class="num" style="color:#8b96ac">2</span> LIBRARY</span>
+        <span class="off"><span class="num" style="color:#8b96ac">3</span> SETTINGS</span>
+      </div>
+      <span class="mirror"><span class="dot">●</span>libgen.li</span>
+    </div>
+    <div class="stage">
+      <pre class="wordmark">████████╗ ██████╗ ███╗   ███╗███████╗███████╗ ██████╗ ██╗     ███████╗
+╚══██╔══╝██╔═══██╗████╗ ████║██╔════╝██╔════╝██╔═══██╗██║     ██╔════╝
+   ██║   ██║   ██║██╔████╔██║█████╗  ███████╗██║   ██║██║     █████╗
+   ██║   ██║   ██║██║╚██╔╝██║██╔══╝  ╚════██║██║   ██║██║     ██╔══╝
+   ██║   ╚██████╔╝██║ ╚═╝ ██║███████╗███████║╚██████╔╝███████╗███████╗
+   ╚═╝    ╚═════╝ ╚═╝     ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚══════╝╚══════╝</pre>
+      <div class="tagline">a terminal client for <b>Library Genesis</b></div>
+      <div class="sub">full-screen interface · scriptable CLI · one small Rust binary</div>
+      <div class="pills">
+        <span class="pill epub">epub</span><span class="pill pdf">pdf</span><span class="pill mobi">mobi</span><span class="pill djvu">djvu</span>
+        <i>— covers drawn right in the terminal</i>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
