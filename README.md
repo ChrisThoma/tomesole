@@ -60,9 +60,8 @@ sessions: `⏎` opens a book in your reader, `f` reveals it in the file manager,
 `/` filters, and `d` forgets an entry without deleting the file. The
 **Settings** tab edits the same values as the config file and saves as you go.
 
-Searching and downloading run on worker threads, so the interface stays
-responsive during a large download. Downloads run one at a time, since parallel
-requests to a volunteer-run mirror tend to get rate-limited.
+Downloads run one at a time, since parallel requests to a volunteer-run mirror
+tend to get rate-limited.
 
 ## The CLI
 
@@ -117,8 +116,7 @@ application opens a book is `reader` in the config, or `--with`.
 ## Finding a live mirror
 
 Mirror domains get seized, expire, or serve a perfectly healthy front page
-while their search endpoint returns HTTP 500 (during development, three of the
-nine built-in mirrors were doing exactly that). So the health check runs a real
+while their search endpoint returns HTTP 500. So the health check runs a real
 search and requires parseable results back: a mirror counts as up only if it
 can do the thing it is needed for.
 
@@ -126,9 +124,8 @@ Mirrors you configured are used without second-guessing. Otherwise tomesole
 reuses a ranking cached from a probe in the last 6 hours, or probes the
 built-in list concurrently and ranks by search latency; if the entire list is
 dead, it asks any reachable mirror for its own list of siblings, so a new
-domain works without a new release. The result is a pool, not a single pick:
-if the chosen mirror fails partway through, the next one is tried
-automatically.
+domain works without a new release. If the chosen mirror fails partway
+through, the next one is tried automatically.
 
 ## Security
 
