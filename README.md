@@ -16,8 +16,8 @@ works, and treating everything it sends back as hostile until proven otherwise.
 
 Run `tomesole` with no arguments for the full-screen interface. It has three
 tabs: **Search** for finding books, **Library** for the ones you already have,
-and **Settings** for editing the configuration. `Tab` cycles through them and
-`1`/`2`/`3` jumps straight to one, including mid-search:
+and **Settings** for editing the configuration. `Tab` cycles through them, even
+while typing, and `1`/`2`/`3` jumps straight to one while browsing:
 
 ```
 ╭  1 SEARCH    2 LIBRARY 12    3 SETTINGS  ────────────────── ● libgen.li ╮
@@ -36,9 +36,9 @@ The interface uses its own colours (a deep blue-grey background with
 zebra-striped rows) rather than inheriting the terminal's. Colour is meaningful:
 teal marks interactive elements, amber marks emphasis, each file format gets its
 own hue as a solid chip (`epub` green, `pdf` coral, `djvu` violet), and languages
-share one blue. On a wide terminal the right-hand panel shows the cover near
-poster size with the record beneath it; narrower terminals get a compact strip
-along the bottom.
+share one blue. The highlighted book's record and cover sit in a band along the
+bottom, so the results table keeps the full width of the screen and never
+fights a side panel for room.
 
 ## Filtering and sorting
 
@@ -61,7 +61,7 @@ default to largest- and newest-first.
 Editions you have already downloaded are marked `library` in their own column
 and with a green dot, so you don't fetch the same book twice. When several
 results are marked for a batch download, the strip totals what they will pull
-(`3 marked · 24 MB`) before you commit. `y` copies the highlighted book's MD5 to
+(`3 marked  24 MB`) before you commit. `y` copies the highlighted book's MD5 to
 the clipboard.
 
 ## The Library tab
@@ -69,8 +69,9 @@ the clipboard.
 The Library tab lists every book you have downloaded, newest first, and persists
 between sessions; it is a view onto `tomesole/history.tsv` under
 `$XDG_DATA_HOME` (by default `~/.local/share/tomesole/history.tsv`). A strip
-under the box summarises the collection (`12 books · 1.2 GB · 8 epub · 3 pdf ·
-1 mobi`), and the same `s` sort orders it by title, author, size or date added.
+under the box summarises the collection (`12 books  ·  1.2 GB` and a breakdown
+of the four commonest formats), and the same `s` sort orders it by title,
+author, size or date added.
 `⏎` opens the highlighted book in your reader, `f` reveals it in the file
 manager, `/` filters by title, author or filename, and `d` forgets an entry
 without deleting the file. Books whose files have moved are greyed out and
@@ -188,8 +189,10 @@ waiting for a reply, which would race with the keyboard reader for the answer.
 `covers = false` in the config, turns covers off entirely.
 
 Two of those three drawing paths need pixels rather than a file, so there is a
-baseline JPEG decoder in-tree (`src/jpeg.rs`). It is checked against Apple's
-decoder on a real cover: mean absolute error 0.54 per channel, maximum 4.
+baseline JPEG decoder in-tree (`src/jpeg.rs`). During development it was
+compared against Apple's decoder on a real cover: mean absolute error 0.54 per
+channel, maximum 4. The in-tree tests check quadrant colours and greyscale
+neutrality rather than repeating that comparison.
 
 ## Past downloads
 
@@ -350,9 +353,10 @@ table id and index the file gives it before use, and the tests fuzz it by
 truncating and corrupting a real image at every offset.
 
 **Opening a file** starts another program, so the path is passed as a single
-argument to `exec` with no shell anywhere in the chain. It is canonicalised
-first, which both proves the file is still there and makes it absolute, so a
-filename cannot be read as a flag by whatever it is handed to.
+argument to `exec` with no shell in the chain (the one exception is revealing
+a file on Windows, where Explorer is reached through `cmd /C start`). It is
+canonicalised first, which both proves the file is still there and makes it
+absolute, so a filename cannot be read as a flag by whatever it is handed to.
 
 ## Dependencies
 
@@ -385,7 +389,9 @@ page.
 cargo test
 ```
 
-307 tests: 304 run without the network and three are ignored by default. They
+308 tests: three are ignored by default and one is Linux-only (file-URI
+escaping for the file manager), so `cargo test` runs 304 on macOS and 305 on
+Linux, all without the network. They
 cover the MD5 vectors, the SSRF and scheme guards, filename sanitising against
 traversal and executable extensions, HTML scanning against real markup, and the
 streaming download path, including that a file failing its checksum is discarded
@@ -398,11 +404,12 @@ panic. The history file is round-tripped with tabs and newlines embedded in the
 metadata, since the format is tab-separated and the metadata comes from Libgen.
 
 The TUI is tested through ratatui's off-screen backend: key handling, cover
-placement, and that it draws without panicking from a 20×8 terminal up to 250×60.
+placement, and that it draws without panicking on terminals from 20×8 through
+80×24 up to 200×60, and at extremes like 250×12.
 Small terminals matter: an earlier version silently clipped the download
 progress bar out of the details pane because the box was one row too short.
 
-Three tests are `#[ignore]`d. `covers_can_be_fetched` needs the network; it
+Three tests are `#[ignore]`d. `covers_can_be_fetched_from_a_real_mirror` needs the network; it
 fetches real covers from a live mirror, which is how the hotlink protection on
 cover images was found in the first place. `extracts_from_a_real_file` wants an
 ebook on disk to pull a cover out of. `dump_design_previews` renders the
