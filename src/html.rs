@@ -54,17 +54,11 @@ fn next_tag(html: &str, from: usize) -> Option<Tag<'_>> {
         let rest = &html[lt..];
 
         if rest.starts_with("<!--") {
-            i = match html[lt..].find("-->") {
-                Some(off) => lt + off + 3,
-                None => return None,
-            };
+            i = html[lt..].find("-->")? + lt + 3;
             continue;
         }
         if rest.starts_with("<!") || rest.starts_with("<?") {
-            i = match html[lt..].find('>') {
-                Some(off) => lt + off + 1,
-                None => return None,
-            };
+            i = html[lt..].find('>')? + lt + 1;
             continue;
         }
 
