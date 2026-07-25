@@ -1,6 +1,6 @@
 [package]
 name = "tomesole"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A terminal client (TUI and CLI) for searching and downloading from Library Genesis"
 license = "MIT"

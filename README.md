@@ -14,12 +14,13 @@ works, and treating everything it sends back as hostile until proven otherwise.
 
 ![tomesole demo: the landing wordmark, a live search for Dune with cover art, filtering by language, then the Library tab showing downloaded books with their jackets](https://raw.githubusercontent.com/ChrisThoma/tomesole/main/docs/demo.gif)
 
-Run `tomesole` with no arguments for the full-screen interface. It has two tabs
-(**Search** for finding books, **Library** for the ones you already have), and
-`Tab` (or `1`/`2`) moves between them from anywhere, including mid-search:
+Run `tomesole` with no arguments for the full-screen interface. It has three
+tabs: **Search** for finding books, **Library** for the ones you already have,
+and **Settings** for editing the configuration. `Tab` cycles through them and
+`1`/`2`/`3` jumps straight to one, including mid-search:
 
 ```
-╭  1 SEARCH    2 LIBRARY 12  ──────────────────────────────── ● libgen.li ╮
+╭  1 SEARCH    2 LIBRARY 12    3 SETTINGS  ────────────────── ● libgen.li ╮
 │❯ dune                                                                   │
 ╰─────────────────────────────────────────────────────────────────────────╯
  e format all   l language English 6   a author all   x clear   s sort year ▼
@@ -66,13 +67,14 @@ the clipboard.
 ## The Library tab
 
 The Library tab lists every book you have downloaded, newest first, and persists
-between sessions; it is a view onto `~/.local/share/tomesole/history.tsv`. A
-strip under the box summarises the collection (`12 books · 1.2 GB · 8 epub · 3
-pdf · 1 mobi`), and the same `s` sort orders it by title, author, size or date
-added. `⏎` opens the highlighted book in your reader, `f` reveals it in the file
+between sessions; it is a view onto `tomesole/history.tsv` under
+`$XDG_DATA_HOME` (by default `~/.local/share/tomesole/history.tsv`). A strip
+under the box summarises the collection (`12 books · 1.2 GB · 8 epub · 3 pdf ·
+1 mobi`), and the same `s` sort orders it by title, author, size or date added.
+`⏎` opens the highlighted book in your reader, `f` reveals it in the file
 manager, `/` filters by title, author or filename, and `d` forgets an entry
-without deleting the file. Books whose files have moved are greyed out and marked
-`missing`.
+without deleting the file. Books whose files have moved are greyed out and
+marked `missing`.
 
 Searching and downloading run on worker threads, so the interface stays
 responsive while a large file downloads. Downloads run one at a time, since
@@ -81,16 +83,27 @@ parallel requests to a volunteer-run mirror tend to get rate-limited.
 Covers are drawn as real pixels in kitty, Ghostty, WezTerm and iTerm2, and as
 half-block characters (sketched above) elsewhere. On the Library tab the cover
 is read out of the downloaded file itself (an EPUB or CBZ is a zip with the
-image inside, a MOBI/AZW embeds it), so it needs no network. Only when the file
-has no cover does it fall back to one cached from an earlier search.
+image inside, a MOBI/AZW embeds it). If the file has no cover, tomesole tries
+one cached from an earlier search, then asks the mirror as a last resort.
+
+## The Settings tab
+
+The Settings tab edits the same values as the config file: cover art, history,
+download verification and size limits, reader, download directory, result
+limit, collections, preferred mirrors and whether cleartext HTTP is allowed.
+Move with `↑`/`↓`, press `⏎` to edit a value, or press `space` to toggle a
+yes/no setting. Collection and mirror rows expand into their own lists; mirrors
+can be added with `a` and removed with `d`. Changes are saved as they are made.
+Settings concerned with startup network policy and search defaults are marked
+as taking effect on the next launch.
 
 ## Keys
 
 | key | does |
 | --- | --- |
-| `Tab` `1` `2` | switch between the Search and Library tabs |
+| `Tab` `1` `2` `3` | cycle through the Search, Library and Settings tabs, or jump straight to one |
 | `/` `i` | type in the box (search terms, or a library filter) |
-| `⏎` | search / download the selection, or open a library book |
+| `⏎` | search / download the selection, open a library book, or edit a setting |
 | `↑` `↓` `k` `j` | move; `PgUp`/`PgDn` for ten, `g`/`G` for ends |
 | `e` `l` `a` | open the format / language / author menu (type to narrow, `⏎` to choose, `⇥` to switch facet); `x` clears every filter |
 | `s` | open the sort menu (relevance, title, author, year, size; `←`/`→` set direction); `S` reverses in place |
@@ -101,7 +114,7 @@ has no cover does it fall back to one cached from an earlier search.
 | `r` | re-run the search / re-read the library |
 | `m` | re-probe mirrors and pick a new one |
 | `?` | key help |
-| `q` `esc` `^c` | quit |
+| `q` | quit while browsing; `esc` also quits Search and Library, and cancels Settings edits; `^c` quits from anywhere |
 
 ## The CLI
 
@@ -161,11 +174,13 @@ How it draws depends on the terminal:
 
 A search result is only an MD5, so its cover is fetched from the mirror. A book
 in your library is a file on disk, and most formats carry their own cover image,
-so the Library tab reads it straight out of the file (EXTH record 201 in a MOBI,
-the cover image inside an EPUB or CBZ zip) with no request at all. Those bytes
-are treated as hostile: offsets and lengths are bounds-checked, nothing is
+so the Library tab first tries to read it straight out of the file (EXTH record
+201 in a MOBI, the cover image inside an EPUB or CBZ zip). Those bytes are
+treated as hostile: offsets and lengths are bounds-checked, nothing is
 decompressed in place, the extracted bytes must begin with a real image
-signature, and a truncated or malformed book yields no cover rather than a crash.
+signature, and a truncated or malformed book yields no cover rather than a
+crash. If the file has no usable cover, the tab tries the cover cache and then
+the mirror.
 
 Terminal detection reads the environment rather than writing a query escape and
 waiting for a reply, which would race with the keyboard reader for the answer.
@@ -197,14 +212,15 @@ $ tomesole open --find dispossessed
 ```
 
 `tomesole open` with no argument takes the most recent. Inside the interface,
-`h` shows the same list: `⏎` opens, `f` reveals, `d` forgets an entry without
-touching the file.
+the Library tab (`2`) shows the same list: `⏎` opens, `f` reveals, and `d`
+forgets an entry without touching the file.
 
-The list is a table at `~/.local/share/tomesole/history.tsv`, mode `0600`,
-capped at the last thousand downloads. Files that have been moved or deleted stay
-listed and are marked missing rather than disappearing. `tomesole history
---clear` forgets everything, cached covers included; `history = false` in the
-config stops it recording at all.
+The list is a table at `tomesole/history.tsv` under `$XDG_DATA_HOME` (by default
+`~/.local/share/tomesole/history.tsv`), mode `0600`, capped at the last thousand
+downloads. Files that have been moved or deleted stay listed and are marked
+missing rather than disappearing. `tomesole history --clear` forgets everything,
+cached covers included; `history = false` in the config stops it recording at
+all.
 
 Which application opens a book is `reader` in the config, or `--with`. On macOS
 that names an application (`Books`, `Preview`); elsewhere it is a command run
@@ -248,8 +264,9 @@ lists downloads, `tomesole history of the peloponnesian war` searches for one.
 
 Selections accept single numbers, lists and ranges: `3`, `1,4,7`, `2-5`.
 
-`tomesole config --init` writes a commented config file to
-`~/.config/tomesole/config.conf`. Flags always override it.
+`tomesole config --init` writes a commented `tomesole/config.conf` under
+`$XDG_CONFIG_HOME` (by default `~/.config/tomesole/config.conf`). Flags always
+override it.
 
 ## Finding a live mirror
 
@@ -339,8 +356,9 @@ filename cannot be read as a flag by whatever it is handed to.
 
 ## Dependencies
 
-Four: `ureq` for HTTPS, `ratatui` and `crossterm` for the full-screen interface,
-and `xattr` on Unix for the macOS quarantine flag.
+Four on any one target: `ureq` for HTTPS, `ratatui` and `crossterm` for the
+full-screen interface, plus `xattr` on Unix for the macOS quarantine flag or
+`windows-sys` on Windows for atomic file replacement.
 
 Everything else is in-tree (argument parsing, HTML scanning, MD5, JSON output,
 base64, the JPEG decoder, the CLI progress bar, table layout and terminal
@@ -367,11 +385,11 @@ page.
 cargo test
 ```
 
-304 tests, no network needed. They cover the MD5 vectors, the SSRF and scheme
-guards, filename sanitising against traversal and executable extensions, HTML
-scanning against real markup, and the streaming download path, including that a
-file failing its checksum is discarded and leaves nothing behind, against a
-throwaway loopback server.
+307 tests: 304 run without the network and three are ignored by default. They
+cover the MD5 vectors, the SSRF and scheme guards, filename sanitising against
+traversal and executable extensions, HTML scanning against real markup, and the
+streaming download path, including that a file failing its checksum is discarded
+and leaves nothing behind, against a throwaway loopback server.
 
 The JPEG decoder is tested against real files produced by `sips`, colour and
 greyscale, then hardened by decoding a truncated copy at every length and a
