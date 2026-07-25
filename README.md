@@ -350,7 +350,7 @@ page.
 cargo test
 ```
 
-268 tests, no network needed. They cover the MD5 vectors, the SSRF and scheme
+304 tests, no network needed. They cover the MD5 vectors, the SSRF and scheme
 guards, filename sanitising against traversal and executable extensions, HTML
 scanning against real markup, and the streaming download path (including that
 a file failing its checksum is discarded and leaves nothing behind) against a
@@ -362,15 +362,17 @@ corrupted copy at every third byte, requiring an error or a picture but never a
 panic. The history file is round-tripped with tabs and newlines embedded in the
 metadata, since the format is tab-separated and the metadata comes from Libgen.
 
-One test is `#[ignore]`d because it needs the network: `cargo test -- --ignored
+Three tests are `#[ignore]`d. One needs the network: `cargo test -- --ignored
 covers_can_be_fetched` fetches real covers from a live mirror, which is how the
-hotlink protection on cover images was found in the first place. A second,
+hotlink protection on cover images was found in the first place. Another,
+`extracts_from_a_real_file`, wants an ebook on disk to pull a cover out of. A
+third,
 `dump_design_previews`, renders the interface's main states to a styled HTML
 page for design review. Set `TOMESOLE_PREVIEW_DIR` to somewhere writable and
 run it with `--ignored`.
 
 The TUI is tested through ratatui's off-screen backend: key handling, cover
-placement, and that it draws without panicking from an 20×8 terminal up to
+placement, and that it draws without panicking from a 20×8 terminal up to
 250×60. Small terminals
 matter: an earlier version silently clipped the download progress bar out of
 the details pane because the box was one row too short.
