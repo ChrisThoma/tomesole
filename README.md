@@ -242,7 +242,7 @@ cargo build --release
 cp target/release/tomesole ~/.local/bin/
 ```
 
-Needs Rust 1.85 or newer (2024 edition). No other build dependencies.
+Needs Rust 1.91 or newer. No other build dependencies.
 
 ## Use
 
