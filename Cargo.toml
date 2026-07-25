@@ -2,9 +2,13 @@
 name = "tomesole"
 version = "0.1.0"
 edition = "2024"
-description = "A clean, safe TUI for searching and downloading from Library Genesis"
+description = "A terminal client (TUI and CLI) for searching and downloading from Library Genesis"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/ChrisThoma/tomesole"
+homepage = "https://individuation.dev/projects/tomesole/"
+keywords = ["libgen", "library-genesis", "ebooks", "tui", "cli"]
+categories = ["command-line-utilities"]
 
 # Kept deliberately small. Only three things here are genuinely not worth
 # hand-rolling: TLS (ureq/rustls), and the OS extended-attribute call used to
