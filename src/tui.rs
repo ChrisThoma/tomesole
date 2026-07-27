@@ -5966,7 +5966,13 @@ mod tests {
         a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.config.download_dir, None);
-        assert_eq!(a.settings.dest_dir, crate::config::default_download_dir());
+        // Anchored, because the built-in default is `.` on a machine with no
+        // ~/Downloads and a destination is recorded as an absolute path.
+        assert_eq!(
+            a.settings.dest_dir,
+            crate::config::absolute(&crate::config::default_download_dir())
+        );
+        assert!(a.settings.dest_dir.is_absolute());
         let _ = std::fs::remove_file(&a.config_path);
     }
 
