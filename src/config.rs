@@ -186,8 +186,9 @@ impl Config {
         line(
             &mut out,
             "# What `tomesole open` hands a book to. On macOS this is an application name,\n\
-             # passed to `open -a`; elsewhere it is a command run with the file as its\n\
-             # argument. Unset means the system default for the file type.",
+             # passed to `open -a`; elsewhere it is a command, run with the file as its\n\
+             # last argument. Options may follow the program, and a path with a space in\n\
+             # it goes in double quotes. Unset means the system default for the file type.",
             "reader",
             self.reader.clone(),
             "Books",
@@ -435,10 +436,13 @@ pub const TEMPLATE: &str = "\
 # verify = true
 
 # What `tomesole open` hands a book to. On macOS this is an application name,
-# passed to `open -a`; elsewhere it is a command run with the file as its
-# argument. Unset means the system default for the file type.
+# passed to `open -a`; elsewhere it is a command, run with the file as its last
+# argument. Options may follow the program, and a path with a space in it goes
+# in double quotes. Unset means the system default for the file type.
 # reader = Books
 # reader = zathura
+# reader = mupdf -r 120
+# reader = \"C:\\Program Files\\SumatraPDF\\SumatraPDF.exe\"
 
 # Keep a record of what has been downloaded, for `tomesole history`.
 # history = true

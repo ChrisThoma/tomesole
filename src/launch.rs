@@ -25,8 +25,9 @@ use crate::{bail, err};
 /// Open a file with `reader`, or with the system default when none is set.
 ///
 /// On macOS `reader` names an application, because that is what `open -a`
-/// takes: `Books`, `Preview`, `/Applications/Skim.app`. Elsewhere it is a
-/// command, run with the file as its only argument: `zathura`, `mupdf`.
+/// takes: `Books`, `Preview`, `/Applications/Skim.app` — one argument, never
+/// split. Elsewhere it is a command, run with the file as its last argument:
+/// `zathura`, `mupdf -r 120`. See [`split_reader`] for how that is taken apart.
 pub fn open(path: &Path, reader: Option<&str>) -> Result<()> {
     let path = resolve(path)?;
 
@@ -37,21 +38,69 @@ pub fn open(path: &Path, reader: Option<&str>) -> Result<()> {
         Some(command) => {
             // A reader like `zathura` stays in the foreground for as long as
             // the book is open, so this one is started and let go of.
-            //
-            // Split on whitespace so `mupdf -r 120` works, since the config
-            // calls this a command. Still no shell: the parts become argv
-            // entries directly, and the path is always the last one.
-            //
-            // The match arm already trimmed this and rejected the empty string,
-            // so there is always a first word to take.
-            let mut parts = command.split_whitespace();
-            let program = parts.next().unwrap_or(command);
-            detach(Command::new(program).args(parts).arg(&path)).with_context(|| {
+            let (program, args) = split_reader(command);
+            detach(Command::new(&program).args(args).arg(&path)).with_context(|| {
                 format!("could not start `{program}` — is it installed and on your PATH?")
             })
         }
         None => open_with_default(&path),
     }
+}
+
+/// Take a configured reader apart into a program and its arguments.
+///
+/// The config calls this a command, so `mupdf -r 120` has to work, and the
+/// obvious whitespace split is what does it. But a program can also live at a
+/// path with a space in it — `C:\Program Files\SumatraPDF\SumatraPDF.exe` is
+/// the ordinary case on Windows, not a corner one — and no split survives that.
+/// So two things rescue it:
+///
+/// * A double-quoted word is kept whole, wherever it appears. That is the way
+///   to say `"/opt/Foxit Reader/FoxitReader" --page 3`.
+/// * Failing that, a string that names a file which is actually there is taken
+///   whole, unsplit. That covers the config someone wrote when a reader could
+///   only ever be one program, before there was anything to quote.
+///
+/// There is still no shell in the chain: these become argv entries directly,
+/// and the file being opened is always appended last by the caller.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn split_reader(command: &str) -> (String, Vec<String>) {
+    if !command.contains('"') && looks_like_path(command) && Path::new(command).is_file() {
+        return (command.to_string(), Vec::new());
+    }
+
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for c in command.chars() {
+        match c {
+            // An unterminated quote simply runs to the end of the line. There
+            // is nothing useful to say about it that starting the program and
+            // letting it fail does not say better.
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    let mut words = words.into_iter();
+    // A command of nothing but quotes leaves no first word. Hand the string
+    // back as it was written so the failure names what the config says.
+    let program = words.next().unwrap_or_else(|| command.to_string());
+    (program, words.collect())
+}
+
+/// Whether a string is shaped like a path rather than a bare program name.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn looks_like_path(s: &str) -> bool {
+    s.contains('/') || (cfg!(windows) && s.contains('\\'))
 }
 
 /// Show a file in the system file manager, selected where that is possible.
@@ -311,6 +360,68 @@ mod tests {
         // is no such executable.
         assert!(open(&file, Some("tomesole-nonesuch --page 3")).is_err());
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_reader_splits_into_a_program_and_its_options() {
+        let (program, args) = split_reader("mupdf -r 120");
+        assert_eq!(program, "mupdf");
+        assert_eq!(args, ["-r", "120"]);
+
+        let (program, args) = split_reader("zathura");
+        assert_eq!(program, "zathura");
+        assert!(args.is_empty());
+    }
+
+    /// The whole point of the quoting: a program whose path contains a space,
+    /// which is the ordinary shape of one on Windows.
+    #[test]
+    fn a_quoted_program_keeps_the_spaces_in_its_path() {
+        let (program, args) = split_reader(r#""/opt/Foxit Reader/FoxitReader" --page 3"#);
+        assert_eq!(program, "/opt/Foxit Reader/FoxitReader");
+        assert_eq!(args, ["--page", "3"]);
+
+        // Quoting works on an argument too, rather than being a rule about the
+        // first word only.
+        let (program, args) = split_reader(r#"mupdf --title "A Book""#);
+        assert_eq!(program, "mupdf");
+        assert_eq!(args, ["--title", "A Book"]);
+    }
+
+    /// A config written before a reader could carry arguments named a program
+    /// and nothing else. Splitting one of those on whitespace would break a
+    /// setup that had been working, so a path that is really there is left
+    /// alone.
+    #[test]
+    fn an_existing_path_with_a_space_is_not_split() {
+        let dir = std::env::temp_dir().join(format!("tomesole launch {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("my reader");
+        std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+
+        let text = program.to_string_lossy().to_string();
+        let (parsed, args) = split_reader(&text);
+        assert_eq!(parsed, text);
+        assert!(args.is_empty(), "an existing path is the whole command");
+
+        // The same path with an option after it is no longer a file that
+        // exists, so it splits — and quoting is how to say what was meant.
+        let (parsed, _) = split_reader(&format!("{text} --page 3"));
+        assert_ne!(parsed, text);
+        let (parsed, args) = split_reader(&format!("\"{text}\" --page 3"));
+        assert_eq!(parsed, text);
+        assert_eq!(args, ["--page", "3"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare word is never treated as a path, so a file in the working
+    /// directory cannot claim a command that was meant for `PATH`.
+    #[test]
+    fn a_bare_program_name_is_not_a_path() {
+        assert!(!looks_like_path("mupdf"));
+        assert!(!looks_like_path("mupdf -r 120"));
+        assert!(looks_like_path("/usr/bin/mupdf"));
     }
 
     /// A reader that does not exist must fail with a sentence, not a panic.
