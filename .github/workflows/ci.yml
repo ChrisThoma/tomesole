@@ -25,6 +25,19 @@ jobs:
       - run: cargo build --verbose
       - run: cargo test --verbose
 
+  # 0.1.2 was yanked for declaring an MSRV it did not hold to. Clippy's
+  # `incompatible_msrv` lint catches stdlib calls that are too new, but not
+  # syntax or a dependency that raises its own floor, so the declared version
+  # gets to compile the crate itself. Keep in step with `rust-version`.
+  msrv:
+    name: msrv (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --verbose
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

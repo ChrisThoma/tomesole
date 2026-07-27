@@ -745,4 +745,310 @@ mod tests {
         .unwrap();
         assert_eq!(v, 1);
     }
+
+    // --- The redirect loop, exercised against a throwaway local server. ---
+    //
+    // Following redirects by hand is the whole reason every hop can be
+    // re-validated, so the loop is tested through `Http` itself rather than by
+    // unit-testing the pieces it calls.
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// One request, as the test server saw it on the wire.
+    #[derive(Clone)]
+    struct Seen {
+        line: String,
+        headers: Vec<(String, String)>,
+    }
+
+    impl Seen {
+        /// The request target, including its query string.
+        fn path(&self) -> &str {
+            self.line.split(' ').nth(1).unwrap_or("")
+        }
+
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// A loopback server that answers a scripted sequence of raw responses and
+    /// records what it was asked for. The last response repeats, so a
+    /// self-referential redirect can be served for as long as a client keeps
+    /// following it.
+    struct Server {
+        port: u16,
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    impl Server {
+        fn start(responses: Vec<Vec<u8>>) -> Self {
+            assert!(!responses.is_empty(), "need at least one response");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().unwrap().port();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                for (i, conn) in listener.incoming().enumerate() {
+                    let Ok(mut stream) = conn else { return };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    let mut lines: Vec<String> = Vec::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        lines.push(line.trim_end().to_string());
+                        line.clear();
+                    }
+                    let Some(request_line) = lines.first().cloned() else {
+                        continue;
+                    };
+                    let headers = lines[1..]
+                        .iter()
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                        .collect();
+                    recorder.lock().unwrap().push(Seen {
+                        line: request_line,
+                        headers,
+                    });
+                    let response = &responses[i.min(responses.len() - 1)];
+                    let _ = stream.write_all(response);
+                    let _ = stream.flush();
+                }
+            });
+            Self { port, seen }
+        }
+
+        fn url(&self, path: &str) -> Uri {
+            format!("http://127.0.0.1:{}{path}", self.port)
+                .parse()
+                .unwrap()
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn redirect_to(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn page(body: &str) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body.as_bytes());
+        out
+    }
+
+    /// Loopback is refused by default, so these tests opt in the way
+    /// `--allow-private-hosts` does.
+    fn loopback_http(max_redirects: usize) -> Http {
+        Http::new(NetPolicy {
+            allow_http: true,
+            allow_private_hosts: true,
+            max_redirects,
+            request_timeout: Duration::from_secs(5),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn follows_redirects_relative_to_the_hop_that_sent_them() {
+        let server = Server::start(vec![
+            redirect_to("get.php?x=1"), // relative to the current directory
+            redirect_to("/final"),      // rooted at the current host
+            page("done"),
+        ]);
+        let body = loopback_http(8)
+            .get_text(&server.url("/a/b/page.php"))
+            .unwrap();
+        assert_eq!(body, "done");
+
+        let seen = server.seen();
+        let paths: Vec<&str> = seen.iter().map(Seen::path).collect();
+        assert_eq!(paths, ["/a/b/page.php", "/a/b/get.php?x=1", "/final"]);
+    }
+
+    /// Interstitials bounce through links that carry a URL inside a query
+    /// parameter. Reading the `://` in one as a scheme dropped the base and
+    /// left a host-less URI that failed several steps later, naming the wrong
+    /// thing. Exercised here through the caller that hit it.
+    #[test]
+    fn follows_a_redirect_carrying_a_url_in_its_query() {
+        let server = Server::start(vec![
+            redirect_to("/out.php?u=https://cdn.example/f"),
+            page("done"),
+        ]);
+        let body = loopback_http(8)
+            .get_text(&server.url("/ads.php?md5=abc"))
+            .unwrap();
+        assert_eq!(body, "done");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2, "the second hop should have been requested");
+        assert_eq!(seen[1].path(), "/out.php?u=https://cdn.example/f");
+    }
+
+    /// A redirect target is validated before it is dialled, not after.
+    ///
+    /// The private-address half of that guard cannot be shown against a
+    /// loopback server — reaching one at all takes the flag that switches the
+    /// address check off — so the address rules are covered by
+    /// [`the_hop_guard_refuses_cloud_metadata`] against the real policy, and
+    /// what is shown here is that the guard runs on a hop rather than only on
+    /// the URL the caller supplied.
+    #[test]
+    fn a_hostile_redirect_target_is_refused_mid_chain() {
+        for hostile in [
+            "ftp://libgen.li/x",
+            "file:///etc/passwd",
+            "gopher://libgen.li/1",
+            "https://user:pw@libgen.li/",
+        ] {
+            let server = Server::start(vec![redirect_to(hostile), page("should never be served")]);
+            let err = loopback_http(8)
+                .get_text(&server.url("/ads.php"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("refusing") || err.contains("bad redirect target"),
+                "{hostile} gave: {err}"
+            );
+            assert_eq!(
+                server.seen().len(),
+                1,
+                "{hostile} should stop the chain, not be followed"
+            );
+        }
+    }
+
+    /// The check each hop runs, on the addresses a loopback test cannot use.
+    #[test]
+    fn the_hop_guard_refuses_cloud_metadata() {
+        let policy = NetPolicy::default();
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "https://169.254.169.254/",
+            "https://127.0.0.1/x",
+            "https://localhost/x",
+        ] {
+            assert!(
+                check_uri_resolves_publicly(&uri(bad), &policy).is_err(),
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_the_hop_count_and_names_the_original_url() {
+        let server = Server::start(vec![redirect_to("/loop")]);
+        let start = server.url("/first.php");
+        let err = loopback_http(2)
+            .get_text(&start)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too many redirects (>2)"), "got: {err}");
+        assert!(err.contains(&start.to_string()), "got: {err}");
+        assert_eq!(server.seen().len(), 3, "one request per allowed hop");
+    }
+
+    #[test]
+    fn a_redirect_without_a_location_is_an_error() {
+        let server = Server::start(vec![
+            b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        let err = loopback_http(8)
+            .get_text(&server.url("/x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("with no Location"), "got: {err}");
+    }
+
+    /// The mirrors serve an empty image to anyone asking without a `Referer`,
+    /// so we send one — but only to the host it names, or a redirect elsewhere
+    /// would leak which record was being looked at.
+    #[test]
+    fn a_referer_is_sent_only_to_the_host_it_names() {
+        let server = Server::start(vec![page("image bytes")]);
+        let referer = server.url("/file.php?id=1");
+        loopback_http(8)
+            .get_referred(&server.url("/covers/x.jpg"), &referer)
+            .unwrap();
+        assert_eq!(
+            server.seen()[0].header("referer"),
+            Some(referer.to_string().as_str())
+        );
+
+        // Same address, different name: the header must not travel.
+        let other = Server::start(vec![page("image bytes")]);
+        let elsewhere: Uri = format!("http://localhost:{}/file.php?id=1", other.port)
+            .parse()
+            .unwrap();
+        loopback_http(8)
+            .get_referred(&other.url("/covers/x.jpg"), &elsewhere)
+            .unwrap();
+        assert_eq!(other.seen()[0].header("referer"), None);
+    }
+
+    /// Resuming means appending at a byte offset, so a re-encoded body would
+    /// corrupt the file: a ranged request has to ask for identity.
+    #[test]
+    fn a_ranged_request_asks_for_an_untransformed_body() {
+        let server = Server::start(vec![
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-11/12\r\n\
+              Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                .to_vec(),
+        ]);
+        let fetched = loopback_http(8).get(&server.url("/f"), Some(10)).unwrap();
+        assert_eq!(fetched.status, 206);
+        assert_eq!(fetched.content_range.as_deref(), Some("bytes 10-11/12"));
+
+        let seen = server.seen();
+        assert_eq!(seen[0].header("range"), Some("bytes=10-"));
+        assert_eq!(seen[0].header("accept-encoding"), Some("identity"));
+    }
+
+    #[test]
+    fn get_text_enforces_the_page_cap() {
+        let oversized = "x".repeat(MAX_PAGE_BYTES as usize + 1);
+        let server = Server::start(vec![page(&oversized)]);
+        let err = loopback_http(8)
+            .get_text(&server.url("/huge"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not read response body"), "got: {err}");
+    }
+
+    /// A failing status never reaches `get_text`'s own check — ureq turns 4xx
+    /// and 5xx into an error of its own — so what matters is that the message
+    /// still names the host it came from, which is all the mirror status table
+    /// has room to show.
+    #[test]
+    fn a_failing_status_is_reported_against_its_host() {
+        let server = Server::start(vec![
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        let err = loopback_http(8)
+            .get_text(&server.url("/gone"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("127.0.0.1:"), "got: {err}");
+        assert!(err.contains("404"), "got: {err}");
+    }
 }
