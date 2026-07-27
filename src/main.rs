@@ -161,11 +161,13 @@ pub fn settings(global: &Global, config: &Config) -> Settings {
 
     Settings {
         policy,
-        dest_dir: global
-            .dest_dir
-            .clone()
-            .or_else(|| config.download_dir.clone())
-            .unwrap_or_else(config::default_download_dir),
+        dest_dir: config::absolute(
+            &global
+                .dest_dir
+                .clone()
+                .or_else(|| config.download_dir.clone())
+                .unwrap_or_else(config::default_download_dir),
+        ),
         max_bytes: global
             .max_size
             .or(config.max_size)
@@ -595,6 +597,7 @@ fn cmd_history(
         return Ok(0);
     }
 
+    history::relink(&settings.dest_dir);
     let mut entries = history::load();
     if let Some(limit) = limit {
         entries.truncate(limit);
@@ -658,6 +661,7 @@ fn cmd_open(
     style: &Style,
 ) -> Result<i32> {
     let settings = settings(&cli.global, config);
+    history::relink(&settings.dest_dir);
     let entries = history::load();
     if entries.is_empty() {
         return Err(crate::err!(

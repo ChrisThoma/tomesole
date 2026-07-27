@@ -43,7 +43,9 @@ impl Entry {
         Entry {
             at: now(),
             md5: book.md5.clone(),
-            path: outcome.path.clone(),
+            // Recorded absolute: an entry outlives the working directory the
+            // download ran in.
+            path: crate::config::absolute(&outcome.path),
             // A skipped download transferred nothing, so the file on disk is
             // the authority on its own size; the catalogue's figure is the last
             // resort.
@@ -222,6 +224,51 @@ pub fn remove_from(path: &Path, target: &Path) -> Result<bool> {
 
 pub fn remove(target: &Path) -> Result<bool> {
     remove_from(&crate::config::history_path(), target)
+}
+
+/// Follow books that have moved into the current download directory.
+///
+/// An entry points at the file we wrote, so moving that file leaves the library
+/// pointing at nothing — which is what happens the moment somebody changes
+/// where downloads land and takes their books with them. Rather than make them
+/// forget and re-download, look for each absent file by name in the directory
+/// downloads go to now, and adopt it if the size agrees. Same name and same
+/// size is a modest bar, but the alternative is re-hashing every file on every
+/// library load, and the cost of being wrong is opening the wrong copy of a
+/// book somebody already has.
+pub fn relink(dir: &Path) -> usize {
+    relink_in(&crate::config::history_path(), dir).unwrap_or(0)
+}
+
+fn relink_in(path: &Path, dir: &Path) -> Result<usize> {
+    with_lock(path, || {
+        // Oldest first, the order the file is stored in.
+        let mut entries: Vec<Entry> = load_from(path).into_iter().rev().collect();
+        let mut moved = 0;
+        for entry in &mut entries {
+            if entry.present() {
+                continue;
+            }
+            let candidate = dir.join(entry.filename());
+            if candidate == entry.path {
+                continue;
+            }
+            let agrees = match std::fs::metadata(&candidate) {
+                // A recorded size of zero is a download we never measured, so
+                // there is nothing to disagree with.
+                Ok(meta) => meta.is_file() && (entry.size == 0 || meta.len() == entry.size),
+                Err(_) => false,
+            };
+            if agrees {
+                entry.path = candidate;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            write_all(path, &entries)?;
+        }
+        Ok(moved)
+    })
 }
 
 /// Forget everything.
@@ -672,6 +719,72 @@ mod tests {
         let loaded = load_from(&path);
         assert_eq!(loaded.len(), 1, "a pre-existing book should enter the library");
         assert_eq!(loaded[0].title, "House of Leaves");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reported bug: change where downloads land, move the books there,
+    /// and every entry reads as missing because it still names the old file.
+    #[test]
+    fn a_book_moved_to_the_new_download_directory_is_found_again() {
+        let dir = temp_dir("relink");
+        let history = dir.join("history.tsv");
+        let books = dir.join("books");
+        std::fs::create_dir_all(&books).unwrap();
+
+        let mut moved = entry("Dune");
+        moved.path = dir.join("old").join("Dune.epub");
+        append_to(&history, &moved).unwrap();
+        std::fs::write(books.join("Dune.epub"), vec![0u8; 1024]).unwrap();
+
+        assert_eq!(relink_in(&history, &books).unwrap(), 1);
+        let loaded = load_from(&history);
+        assert_eq!(loaded[0].path, books.join("Dune.epub"));
+        assert!(loaded[0].present());
+        // The rest of the entry is untouched — this is a move, not a new
+        // download.
+        assert_eq!(loaded[0].at, moved.at);
+        assert_eq!(loaded[0].md5, moved.md5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A different book that happens to share a filename is not the same book.
+    #[test]
+    fn a_same_named_file_of_another_size_is_not_adopted() {
+        let dir = temp_dir("relink-size");
+        let history = dir.join("history.tsv");
+        let books = dir.join("books");
+        std::fs::create_dir_all(&books).unwrap();
+
+        let mut gone = entry("Dune");
+        gone.path = dir.join("old").join("Dune.epub");
+        append_to(&history, &gone).unwrap();
+        std::fs::write(books.join("Dune.epub"), b"a different book").unwrap();
+
+        assert_eq!(relink_in(&history, &books).unwrap(), 0);
+        assert_eq!(load_from(&history)[0].path, gone.path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file still where we left it is never re-pointed, even if the download
+    /// directory holds something of the same name.
+    #[test]
+    fn a_present_file_is_left_alone() {
+        let dir = temp_dir("relink-present");
+        let history = dir.join("history.tsv");
+        let books = dir.join("books");
+        std::fs::create_dir_all(&books).unwrap();
+
+        let mut here = entry("Dune");
+        here.path = dir.join("Dune.epub");
+        std::fs::write(&here.path, vec![0u8; 1024]).unwrap();
+        append_to(&history, &here).unwrap();
+        std::fs::write(books.join("Dune.epub"), vec![0u8; 1024]).unwrap();
+
+        assert_eq!(relink_in(&history, &books).unwrap(), 0);
+        assert_eq!(load_from(&history)[0].path, here.path);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

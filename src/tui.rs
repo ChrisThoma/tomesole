@@ -1615,6 +1615,10 @@ impl App {
     /// Re-read the library from disk and reapply the filter, keeping the
     /// highlight on something sensible.
     fn reload_library(&mut self) {
+        // Books that moved into the download directory since we last looked are
+        // adopted here, so changing that directory and taking your library with
+        // you does not leave every entry reading as missing.
+        history::relink(&self.settings.dest_dir);
         self.library = history::load();
         self.owned = self.library.iter().map(|e| e.md5.clone()).collect();
         self.refilter();
@@ -2542,11 +2546,13 @@ impl App {
                     self.config.max_size.unwrap_or(crate::DEFAULT_MAX_BYTES);
             }
             Field::DownloadDir if !self.settings.overrides.dest_dir => {
-                self.settings.dest_dir = self
-                    .config
-                    .download_dir
-                    .clone()
-                    .unwrap_or_else(crate::config::default_download_dir);
+                self.settings.dest_dir = crate::config::absolute(
+                    &self
+                        .config
+                        .download_dir
+                        .clone()
+                        .unwrap_or_else(crate::config::default_download_dir),
+                );
             }
             // Deferred: only takes effect next launch.
             _ => {}

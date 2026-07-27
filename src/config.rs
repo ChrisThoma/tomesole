@@ -321,6 +321,33 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// Anchor a relative path to the working directory.
+///
+/// The history records where a book landed, and a relative path only means
+/// anything from the directory the download ran in — start the program
+/// somewhere else and every one of those books reads as missing. The default
+/// download directory is `.` whenever `~/Downloads` does not exist, which is
+/// the usual state of a fresh WSL or server home, so this is not an exotic
+/// case. `canonicalize` is deliberately not used: it wants the path to exist
+/// and it resolves symlinks, neither of which is wanted for a directory we may
+/// be about to create.
+pub fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            // `./books` and `books` name the same place; keep the join clean.
+            match path.strip_prefix(".") {
+                Ok(rest) if rest.as_os_str().is_empty() => cwd,
+                Ok(rest) => cwd.join(rest),
+                Err(_) => cwd.join(path),
+            }
+        }
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// The user's home directory.
 ///
 /// `HOME` first, so an explicit setting always wins, then `USERPROFILE`, which
@@ -622,6 +649,23 @@ mod tests {
         assert_eq!(expand_tilde("~\\x"), home_dir().join("x"));
         #[cfg(not(windows))]
         assert_eq!(expand_tilde("~\\x"), PathBuf::from("~\\x"));
+    }
+
+    /// The default download directory is `.` when there is no `~/Downloads`,
+    /// and a book recorded at a relative path is only findable from the
+    /// directory it was downloaded in.
+    #[test]
+    fn a_relative_download_path_is_anchored_to_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolute(Path::new(".")), cwd);
+        assert_eq!(absolute(Path::new("./Dune.epub")), cwd.join("Dune.epub"));
+        assert_eq!(
+            absolute(Path::new("books/Dune.epub")),
+            cwd.join("books/Dune.epub")
+        );
+        // An absolute path is already an answer and is passed through whole.
+        let absolute_already = home_dir().join("Downloads");
+        assert_eq!(absolute(&absolute_already), absolute_already);
     }
 
     /// Every path this module produces hangs off the home directory, so a
