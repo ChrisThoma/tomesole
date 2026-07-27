@@ -1,6 +1,6 @@
 [package]
 name = "tomesole"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.91"
 description = "A terminal client (TUI and CLI) for searching and downloading from Library Genesis"
