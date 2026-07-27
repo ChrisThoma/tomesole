@@ -138,7 +138,7 @@ pub fn reveal(path: &Path) -> Result<()> {
             return Ok(());
         }
         let folder = path.parent().unwrap_or(Path::new("."));
-        open_with_default(folder)
+        open_with_default(folder).map_err(|_| err!("{}", cannot_show_message(&path, is_wsl())))
     }
 }
 
@@ -159,14 +159,71 @@ fn open_with_default(path: &Path) -> Result<()> {
         if run(Command::new("xdg-open").arg(path)).is_ok() {
             return Ok(());
         }
-        run(Command::new("gio").arg("open").arg(path)).map_err(|_| {
-            err!(
-                "could not open {} — neither `xdg-open` nor `gio` worked. \
-                 Set `reader` in the config to name a program directly.",
-                path.display()
-            )
-        })
+        run(Command::new("gio").arg("open").arg(path))
+            .map_err(|_| err!("{}", no_handler_message(path, is_wsl())))
     }
+}
+
+/// What to say when nothing on this system will open a book.
+///
+/// Two things matter here. It has to fit on one line in the full-screen
+/// interface, so it names the file rather than its path and holds that name to
+/// a length a book title cannot blow past. And it has to end with something to
+/// do, since knowing that nothing is installed does not get a book open.
+#[allow(dead_code)]
+fn no_handler_message(path: &Path, wsl: bool) -> String {
+    let name = short_name(path);
+    if wsl {
+        // WSL has no desktop of its own; opening a book means handing it back
+        // to Windows, which is exactly what `wslview` is for.
+        format!(
+            "could not open {name} — WSL has no desktop to hand it to. \
+             Run `sudo apt install wslu`, then put `reader = wslview` in the config"
+        )
+    } else {
+        format!(
+            "could not open {name} — neither `xdg-open` nor `gio` worked. \
+             Install `xdg-utils`, or name a reader in the config, e.g. `reader = zathura`"
+        )
+    }
+}
+
+/// The same, for showing a file rather than opening one.
+///
+/// `reader` has no bearing on this path, so repeating that advice here would
+/// send someone to edit a setting that cannot help.
+#[allow(dead_code)]
+fn cannot_show_message(path: &Path, wsl: bool) -> String {
+    let name = short_name(path);
+    if wsl {
+        format!(
+            "could not show {name} — WSL has no file manager. \
+             Run `explorer.exe .` in that folder to see it from Windows"
+        )
+    } else {
+        format!(
+            "could not show {name} — neither the freedesktop call nor `xdg-open` worked. \
+             Install `xdg-utils`, or open the folder yourself"
+        )
+    }
+}
+
+/// A file's name, short enough to leave room for the rest of a message.
+#[allow(dead_code)]
+fn short_name(path: &Path) -> String {
+    let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+    crate::term::truncate(&name, 40)
+}
+
+/// Whether this is the Linux side of WSL.
+///
+/// `WSL_DISTRO_NAME` is set by the interop layer; the kernel release string is
+/// the fallback for a shell that started without it.
+#[allow(dead_code)]
+fn is_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
 }
 
 /// Hand a path to the shell's default handler for its type.
@@ -422,6 +479,52 @@ mod tests {
         assert!(!looks_like_path("mupdf"));
         assert!(!looks_like_path("mupdf -r 120"));
         assert!(looks_like_path("/usr/bin/mupdf"));
+    }
+
+    /// Knowing that nothing can open the file does not get it open, so both
+    /// forms of the message have to end with something to do.
+    #[test]
+    fn the_no_handler_message_says_what_to_do_next() {
+        let path = Path::new("/books/A Book.pdf");
+
+        let generic = no_handler_message(path, false);
+        assert!(generic.contains("A Book.pdf"), "got: {generic}");
+        assert!(generic.contains("xdg-utils"), "got: {generic}");
+        assert!(generic.contains("reader = zathura"), "got: {generic}");
+
+        // WSL has no desktop at all, so pointing at xdg-utils would be a
+        // wasted install.
+        let wsl = no_handler_message(path, true);
+        assert!(wsl.contains("wslu") && wsl.contains("reader = wslview"), "got: {wsl}");
+        assert!(!wsl.contains("xdg-utils"), "got: {wsl}");
+    }
+
+    /// `reader` is not consulted when showing a file, so the advice for that
+    /// failure has to be different advice, not the same sentence reused.
+    #[test]
+    fn showing_a_file_is_not_told_to_set_a_reader() {
+        for wsl in [true, false] {
+            let message = cannot_show_message(Path::new("/books/A Book.pdf"), wsl);
+            assert!(message.contains("A Book.pdf"), "got: {message}");
+            assert!(!message.contains("reader"), "got: {message}");
+        }
+        assert!(cannot_show_message(Path::new("/books/A Book.pdf"), true).contains("explorer.exe"));
+    }
+
+    /// A book title is as long as its publisher felt like making it, and the
+    /// advice sits at the end of the message. One must not push out the other.
+    #[test]
+    fn a_long_title_cannot_crowd_out_the_advice() {
+        let path = PathBuf::from(format!("/books/{}.pdf", "Dungeons and Dragons ".repeat(20)));
+        for wsl in [true, false] {
+            let message = no_handler_message(&path, wsl);
+            assert!(
+                message.len() < 200,
+                "{} bytes: {message}",
+                message.len()
+            );
+            assert!(message.ends_with("in the config") || message.contains("reader = zathura"));
+        }
     }
 
     /// A reader that does not exist must fail with a sentence, not a panic.

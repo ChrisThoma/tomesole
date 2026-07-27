@@ -2886,7 +2886,15 @@ impl App {
                 Tab::Settings => Vec::new(),
             }
         };
-        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+        // Errors here can be a sentence and a half — what failed, then what to
+        // do about it — so they fold onto a second line rather than losing the
+        // half that helps.
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
     }
 
     /// The refinement bar: the three facets and what they leave showing.
@@ -4690,12 +4698,20 @@ fn clipboard_osc(text: &str) -> String {
 
 /// Error chains get long; the pane has one line for them.
 fn first_line(message: &str) -> String {
+    // A guard against a runaway message. The errors this program writes are
+    // meant to be read whole, and the one place they are drawn folds them
+    // rather than clipping, so the bound only has to stop something
+    // pathological. The old one was tight enough to cut an ordinary sentence,
+    // taking with it the half that says what to do, so it is generous now and
+    // cuts back to a word when it does fire.
+    const MAX: usize = 400;
     let line = message.lines().next().unwrap_or(message).trim();
-    if line.len() > 200 {
-        format!("{}…", &line[..line.floor_char_boundary(200)])
-    } else {
-        line.to_string()
+    if line.len() <= MAX {
+        return line.to_string();
     }
+    let cut = line.floor_char_boundary(MAX);
+    let cut = line[..cut].rfind(' ').unwrap_or(cut);
+    format!("{}…", line[..cut].trim_end())
 }
 
 #[cfg(test)]
@@ -5594,6 +5610,32 @@ mod tests {
         assert_eq!(short_duration(45), "45s");
         assert_eq!(short_duration(200), "3m 20s");
         assert_eq!(short_duration(3900), "1h 05m");
+    }
+
+    /// An error that says what failed and then what to do about it must arrive
+    /// whole. The old bound cut one of these mid-word, taking the advice with
+    /// it — which is the half worth reading.
+    #[test]
+    fn an_error_carrying_advice_is_not_shortened() {
+        let message = "could not open A Book.pdf — WSL has no desktop to hand it to. \
+                       Run `sudo apt install wslu`, then put `reader = wslview` in the config";
+        assert_eq!(first_line(message), message);
+    }
+
+    #[test]
+    fn a_runaway_message_is_cut_back_to_a_word() {
+        let cut = first_line(&"nonsense ".repeat(200));
+        assert!(cut.ends_with('…'), "got: {cut}");
+        assert!(cut.len() <= 404, "{} bytes", cut.len());
+        // Cut between words, so the last one that survives is intact.
+        assert!(cut.trim_end_matches('…').ends_with("nonsense"), "got: {cut}");
+    }
+
+    /// Only the first line ever reaches the interface, so a message with a
+    /// second one still fits on a row.
+    #[test]
+    fn only_the_first_line_of_an_error_is_shown() {
+        assert_eq!(first_line("failed to save\ncaused by: disk full"), "failed to save");
     }
 
     fn entries(n: usize) -> Vec<history::Entry> {
