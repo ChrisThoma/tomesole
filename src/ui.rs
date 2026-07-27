@@ -438,6 +438,39 @@ mod tests {
         );
     }
 
+    /// The end of the path the mirror's bytes actually travel: hostile markup
+    /// through the scanner and out into the table someone is looking at.
+    #[test]
+    fn escape_sequences_from_a_mirror_never_reach_the_table() {
+        let mut list = books();
+        list[0].title = crate::html::text("Dune&#27;[2J&#27;[1;1HOWNED");
+        list[0].authors = Some(crate::html::text("Herbert\u{1b}[31m"));
+        list[0].language = Some(crate::html::text("&#7;English"));
+
+        let rendered = render_results(&list, &Style::plain());
+        // Per line, since the table's own newlines are control characters.
+        for line in rendered.lines() {
+            assert!(
+                !line.chars().any(char::is_control),
+                "an escape survived into the results table: {line:?}"
+            );
+        }
+        // The row is still legible; the escape was neutralised, not the title.
+        assert!(rendered.contains("Dune"), "{rendered}");
+    }
+
+    /// Control characters count as zero cells wide, so one that survived would
+    /// silently break the alignment the other tests here assert.
+    #[test]
+    fn a_hostile_title_still_respects_the_terminal_width() {
+        let mut list = books();
+        list[0].title = crate::html::text(&"&#27;[1m".repeat(40));
+        let width = terminal_width();
+        for line in render_results(&list, &Style::plain()).lines() {
+            assert!(display_width(line) <= width, "{line:?}");
+        }
+    }
+
     #[test]
     fn missing_metadata_renders_blank_not_none() {
         let rendered = render_results(&books(), &Style::plain());
@@ -564,3 +597,4 @@ mod tests {
         }
     }
 }
+

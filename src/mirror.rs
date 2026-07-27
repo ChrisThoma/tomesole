@@ -119,7 +119,7 @@ pub fn probe_all(candidates: &[Uri], policy: &NetPolicy) -> Vec<MirrorStatus> {
                 scope.spawn(move || {
                     let started = Instant::now();
                     let outcome =
-                        match Http::new(probe_policy).and_then(|http| libgen::probe(&http, base)) {
+                        match libgen::probe(&Http::new(probe_policy), base) {
                             Ok(results) => Outcome::Healthy {
                                 latency: started.elapsed(),
                                 results,
@@ -199,9 +199,28 @@ pub fn discover(http: &Http, base: &Uri, policy: &NetPolicy) -> Vec<Uri> {
     found
 }
 
+/// Whether a discovered host is plausibly a Libgen front-end.
+///
+/// Matched against the registrable part of the name rather than the whole
+/// string. A bare `contains` would accept `libgen.attacker.example`, where the
+/// interesting half of the name is the part this check is meant to be reading.
 fn looks_like_libgen(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
-    host.contains("libgen") || host.contains("genesis")
+    let host = host.trim_end_matches('.');
+    // `libgen.li` → `libgen`; `mirror.libgen.gs` → `libgen`. The last label is
+    // the TLD, which moves constantly and says nothing.
+    let mut labels = host.rsplit('.').skip(1);
+    let Some(domain) = labels.next() else {
+        return false;
+    };
+    // Step over a two-part suffix, so `libgen.co.uk` is read as `libgen` rather
+    // than as `co`. Not a public-suffix list, just the handful that turn up.
+    let domain = if matches!(domain, "co" | "com" | "net" | "org" | "ac" | "gov") {
+        labels.next().unwrap_or(domain)
+    } else {
+        domain
+    };
+    domain.contains("libgen") || domain.contains("genesis")
 }
 
 /// An ordered set of mirrors to try, best first.
@@ -327,12 +346,10 @@ pub fn resolve(policy: &NetPolicy, opts: ResolveOptions<'_>) -> Result<Pool> {
 
 /// Try each seed's `mirrors.php` until one yields candidates.
 fn discover_from_any(seeds: &[Uri], policy: &NetPolicy) -> Vec<Uri> {
-    let Ok(http) = Http::new(NetPolicy {
+    let http = Http::new(NetPolicy {
         request_timeout: PROBE_TIMEOUT,
         ..*policy
-    }) else {
-        return Vec::new();
-    };
+    });
     for seed in seeds {
         let found = discover(&http, seed, policy);
         if !found.is_empty() {
@@ -531,6 +548,25 @@ mod tests {
         assert!(looks_like_libgen("library.genesis.example"));
         assert!(!looks_like_libgen("ads.doubleclick.net"));
         assert!(!looks_like_libgen("evil.example"));
+    }
+
+    /// The name has to be Libgen's, not merely mention it. A mirror page is
+    /// written by a third party, and `libgen.` as a subdomain label is the
+    /// cheapest way to have this hand back somebody else's host.
+    #[test]
+    fn a_libgen_shaped_subdomain_of_another_domain_is_refused() {
+        assert!(!looks_like_libgen("libgen.attacker.example"));
+        assert!(!looks_like_libgen("libgen.li.attacker.example"));
+        assert!(!looks_like_libgen("genesis.evil.test"));
+        // The real thing, including under a subdomain and a two-part suffix.
+        assert!(looks_like_libgen("mirror.libgen.gs"));
+        assert!(looks_like_libgen("libgen.co.uk"));
+        assert!(looks_like_libgen("LIBGEN.LI"));
+        // A trailing root dot must not shift the labels along.
+        assert!(looks_like_libgen("libgen.li."));
+        // Degenerate names have no registrable part to read.
+        assert!(!looks_like_libgen("libgen"));
+        assert!(!looks_like_libgen(""));
     }
 
     #[test]

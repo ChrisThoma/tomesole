@@ -137,12 +137,30 @@ fn next_tag(html: &str, from: usize) -> Option<Tag<'_>> {
 
 /// Advance past a raw-text element's content, returning the offset of its
 /// closing tag.
+///
+/// Matched over the bytes rather than by lowercasing the remainder of the
+/// document: a page may hold a dozen `<script>` tags, and allocating a fresh
+/// copy of everything after each one turns scanning an 8 MB page into quadratic
+/// work. `<` and `/` are ASCII, so an offset found this way is always a
+/// character boundary.
 fn skip_raw_text(html: &str, name: &str, content_start: usize) -> usize {
-    let needle = format!("</{name}");
-    match html[content_start..].to_ascii_lowercase().find(&needle) {
-        Some(off) => content_start + off,
-        None => html.len(),
+    let haystack = html.as_bytes();
+    let needle = name.as_bytes();
+    // The shortest thing that could match is `</name`, so anything shorter than
+    // that has no closing tag left in it to find.
+    let Some(last) = haystack.len().checked_sub(needle.len() + 2) else {
+        return html.len();
+    };
+
+    for i in content_start..=last {
+        if haystack[i] == b'<'
+            && haystack[i + 1] == b'/'
+            && haystack[i + 2..i + 2 + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            return i;
+        }
     }
+    html.len()
 }
 
 /// Given the offset just past an element's opening tag, return the byte range
@@ -351,7 +369,13 @@ fn collapse_whitespace(s: &str) -> String {
     let mut last_was_space = false;
     for c in s.chars() {
         // Non-breaking space counts as whitespace for display purposes.
-        if c.is_whitespace() || c == '\u{a0}' {
+        //
+        // Control characters are folded in with it. Everything this function
+        // produces is printed to a terminal, and an ESC that survived would let
+        // a mirror move the cursor, clear the screen, or repaint a row of the
+        // results table — so they are collapsed away here rather than at each
+        // of the several places that draw the text.
+        if c.is_whitespace() || c == '\u{a0}' || c.is_control() {
             if !last_was_space {
                 out.push(' ');
             }
@@ -418,7 +442,15 @@ fn decode_one(body: &str) -> Option<String> {
         } else {
             num.parse::<u32>().ok()?
         };
-        return char::from_u32(code).map(|c| c.to_string());
+        // A numeric entity is the one way markup can name a control character
+        // outright — `&#27;` for ESC. Refusing it here leaves the entity as the
+        // literal text it was written as, which is both honest and inert.
+        // `collapse_whitespace` catches raw control bytes; this catches the
+        // encoded ones, including on the attribute path, which does not go
+        // through it.
+        return char::from_u32(code)
+            .filter(|c| !c.is_control())
+            .map(|c| c.to_string());
     }
     let named = match body.to_ascii_lowercase().as_str() {
         "amp" => "&",
@@ -522,6 +554,32 @@ mod tests {
         assert_eq!(text(cells[0]), "real");
     }
 
+    /// The raw-text skip is a byte scan rather than a lowercased copy of the
+    /// document tail, so the cases the copy used to handle for free — casing,
+    /// a truncated closing tag, a document too short to hold one — are worth
+    /// pinning down.
+    #[test]
+    fn raw_text_is_skipped_whatever_its_closing_tag_looks_like() {
+        let html = r#"<div><script>var x = "<td>fake</td>";</SCRIPT><td>real</td></div>"#;
+        let cells = children(children(html, "div")[0], "td");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(text(cells[0]), "real");
+
+        // An unterminated script swallows the rest, which is the safe answer.
+        let cells = children("<div><script>var x = \"<td>fake</td>\";", "td");
+        assert!(cells.is_empty(), "got {cells:?}");
+
+        // Multibyte content between the tags must not split a character.
+        let html = "<div><style>/* 日本語のコメント */</style><td>ok</td></div>";
+        assert_eq!(text(children(html, "div")[0]), "ok");
+
+        // Short enough that there is no room for a closing tag at all.
+        for tiny in ["<script>", "<script>x", "<style>", ""] {
+            let _ = children(tiny, "td");
+            let _ = text(tiny);
+        }
+    }
+
     #[test]
     fn handles_unclosed_rows() {
         let html = "<table><tr><td>one</td><tr><td>two</td></table>";
@@ -548,6 +606,51 @@ mod tests {
         assert_eq!(decode_entities("&#x41;"), "A");
         assert_eq!(decode_entities("caf&eacute;"), "caf&eacute;"); // unknown, left alone
         assert_eq!(decode_entities("100% &"), "100% &");
+    }
+
+    /// A title is printed straight to a terminal, so an escape sequence hidden
+    /// in one would let a mirror clear the screen or repaint a row of results.
+    #[test]
+    fn control_characters_never_survive_into_text() {
+        // `&#27;` is ESC. The entity is refused, so what shows is what was
+        // written rather than what it would have done.
+        assert_eq!(
+            text("Innocent&#27;[2J&#27;[1;1HGOTCHA"),
+            "Innocent&#27;[2J&#27;[1;1HGOTCHA"
+        );
+        assert_eq!(text("&#x1b;[31mred"), "&#x1b;[31mred");
+        // A raw control byte in the markup is folded into whitespace.
+        assert_eq!(text("before\u{1b}[2Jafter"), "before [2Jafter");
+        assert_eq!(text("bell\u{7}here"), "bell here");
+        // C1 controls too, which some terminals read as escapes on their own.
+        assert_eq!(text("&#155;5n"), "&#155;5n");
+
+        for hostile in [
+            "&#27;", "&#x9b;", "&#0;", "\u{1b}", "\u{7f}", "&#7;&#8;&#13;",
+        ] {
+            assert!(
+                !text(hostile).chars().any(char::is_control),
+                "control character survived: {hostile:?}"
+            );
+        }
+    }
+
+    /// Attribute values do not pass through the whitespace collapsing that
+    /// `text` applies, so the entity refusal has to cover them on its own.
+    #[test]
+    fn control_characters_never_survive_into_attributes() {
+        let attrs = r#" href="/a&#27;[2Jb" "#;
+        let href = get_attr(attrs, "href").unwrap();
+        assert!(!href.chars().any(char::is_control), "got {href:?}");
+    }
+
+    /// The ordinary entities still have to work; refusing controls must not
+    /// have taken the printable ones with it.
+    #[test]
+    fn printable_entities_are_unaffected() {
+        assert_eq!(decode_entities("&#8597;"), "↕");
+        assert_eq!(decode_entities("&#x41;"), "A");
+        assert_eq!(decode_entities("&#160;caf&eacute;"), "\u{a0}caf&eacute;");
     }
 
     #[test]

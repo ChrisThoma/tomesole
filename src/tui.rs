@@ -10,7 +10,7 @@
 //! requests at a volunteer-run mirror is a good way to get rate-limited, and it
 //! makes the progress display much easier to read.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -144,10 +144,15 @@ enum Ev {
         md5: String,
         outcome: std::result::Result<String, String>,
     },
-    /// A cover lookup finished. `None` means the book has no cover.
+    /// A cover lookup finished. `None` means there is nothing to show — either
+    /// the book has no cover or this terminal cannot draw the one it has.
+    ///
+    /// The picture arrives already decoded, because decoding it is the one
+    /// expensive thing done with a mirror's bytes and the UI thread is the last
+    /// place it belongs.
     Cover {
         md5: String,
-        result: std::result::Result<Option<Cover>, String>,
+        result: std::result::Result<Option<Art>, String>,
     },
 }
 
@@ -183,6 +188,52 @@ struct Art {
     encoded: Vec<u8>,
     /// Decoded pixels, for kitty and for the half-block fallback.
     pixels: Option<graphics::Image>,
+}
+
+/// The largest thumbnail worth keeping in hand.
+///
+/// A cover is drawn into a pane a few dozen cells across, so the decoded
+/// picture is scaled to this once, on the worker thread, and the full-size
+/// original is dropped. Otherwise every browsed book would park its native
+/// resolution — up to the decoder's ceiling of sixteen megapixels, forty-eight
+/// megabytes of RGB — in a map that outlives the selection.
+const THUMB_W: usize = 400;
+const THUMB_H: usize = 600;
+
+/// How many covers to keep. Browsing is unbounded; memory should not be.
+const MAX_COVERS: usize = 64;
+
+impl Art {
+    /// Turn a fetched cover into whatever this terminal can actually draw,
+    /// decoding and scaling it here so the UI thread never has to.
+    ///
+    /// `None` means there is nothing to show: half blocks can only draw pixels,
+    /// so a cover in a format the in-tree decoder does not read is no cover at
+    /// all on that path.
+    fn of(protocol: Protocol, cover: Cover) -> Option<Art> {
+        let thumbnail = || cover.pixels().map(|image| image.fit(THUMB_W, THUMB_H));
+        match protocol {
+            // iTerm2 takes the encoded file, so nothing needs decoding.
+            Protocol::ITerm2 => Some(Art {
+                encoded: cover.encoded,
+                pixels: None,
+            }),
+            // Kitty takes either; raw RGB spares it a decode, and a PNG it can
+            // read itself falls back to the encoded file.
+            Protocol::Kitty => {
+                let pixels = thumbnail();
+                Some(Art {
+                    encoded: cover.encoded,
+                    pixels,
+                })
+            }
+            Protocol::Blocks => thumbnail().map(|pixels| Art {
+                encoded: Vec::new(),
+                pixels: Some(pixels),
+            }),
+            Protocol::None => None,
+        }
+    }
 }
 
 /// The two halves of the program: finding books, and reading the ones you have.
@@ -634,6 +685,10 @@ pub struct App {
     /// How this terminal can draw a picture, if at all.
     protocol: Protocol,
     covers: HashMap<String, Slot>,
+    /// The MD5s in `covers`, oldest first, so the map can be held to
+    /// [`MAX_COVERS`]. A session browsing a long results list would otherwise
+    /// accumulate every thumbnail it ever looked at.
+    cover_order: VecDeque<String>,
     /// The selection is only worth a cover request once it stops moving.
     cover_due: Option<Instant>,
     /// What is currently painted on the screen by escape code, and where, so
@@ -642,6 +697,9 @@ pub struct App {
     /// Where the last frame left room for the picture. Set during rendering,
     /// read afterwards by the code that writes the escape sequence.
     cover_area: Option<Rect>,
+    /// Text a keypress asked to be put on the clipboard, written out by the
+    /// event loop once the key handler has returned.
+    pending_yank: Option<String>,
     /// A frame counter, bumped once per draw, that drives the small animated
     /// spinner shown while something is in flight. The event loop wakes on a
     /// 250 ms timer even when idle, so it turns at a calm few frames a second.
@@ -768,9 +826,11 @@ pub fn run(settings: Settings, config: Config, initial_query: Option<String>) ->
         library_table: TableState::default(),
         protocol,
         covers: HashMap::new(),
+        cover_order: VecDeque::new(),
         cover_due: None,
         painted: None,
         cover_area: None,
+        pending_yank: None,
         spinner: 0,
     };
     app.pending_search = !app.query.is_empty();
@@ -812,8 +872,10 @@ impl App {
             self.poll_cover();
             terminal.draw(|frame| self.render(frame))?;
             // Pixel protocols write outside ratatui's buffer, so the picture is
-            // placed after the frame it belongs to has been drawn.
+            // placed after the frame it belongs to has been drawn. The clipboard
+            // escape goes out here for the same reason.
             self.paint_cover();
+            self.flush_yank();
         }
         Ok(())
     }
@@ -874,15 +936,13 @@ impl App {
         let settings = self.settings.clone();
         let mirrors = self.mirrors.clone();
         std::thread::spawn(move || {
-            let payload = Http::new(settings.policy)
-                .and_then(|http| {
-                    Pool::new(mirrors)
-                        .try_each(
-                            |base| net::with_retry(2, |_| libgen::search(&http, base, &query)),
-                            |_, _| {},
-                        )
-                        .map(|(books, used)| (books, net::host_of(&used).unwrap_or_default()))
-                })
+            let http = Http::new(settings.policy);
+            let payload = Pool::new(mirrors)
+                .try_each(
+                    |base| net::with_retry(2, |_| libgen::search(&http, base, &query)),
+                    |_, _| {},
+                )
+                .map(|(books, used)| (books, net::host_of(&used).unwrap_or_default()))
                 .map_err(|e| e.to_string());
             let _ = tx.send(Ev::Results {
                 generation,
@@ -935,18 +995,7 @@ impl App {
         let settings = self.settings.clone();
         let mirrors = self.mirrors.clone();
         std::thread::spawn(move || {
-            let http = match Http::new(settings.policy) {
-                Ok(h) => h,
-                Err(e) => {
-                    for book in &chosen {
-                        let _ = tx.send(Ev::Finished {
-                            md5: book.md5.clone(),
-                            outcome: Err(e.to_string()),
-                        });
-                    }
-                    return;
-                }
-            };
+            let http = Http::new(settings.policy);
             let pool = Pool::new(mirrors);
 
             for book in chosen {
@@ -1289,25 +1338,27 @@ impl App {
         let Some(book) = self.selected().cloned() else {
             return;
         };
-        self.covers.insert(md5, Slot::Looking);
+        self.remember_cover(md5, Slot::Looking);
 
         let tx = self.tx.clone();
         let settings = self.settings.clone();
         let mirrors = self.mirrors.clone();
+        let protocol = self.protocol;
         std::thread::spawn(move || {
-            let result = Http::new(settings.policy).and_then(|http| {
-                // One mirror only. A cover is not worth walking the pool for,
-                // and a mirror that cannot serve one is usually about to fail
-                // the next search anyway.
-                let base = mirrors
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| crate::err!("no mirror available"))?;
-                cover::fetch(&http, &base, &book)
-            });
+            let http = Http::new(settings.policy);
+            // One mirror only. A cover is not worth walking the pool for, and a
+            // mirror that cannot serve one is usually about to fail the next
+            // search anyway.
+            let result = match mirrors.first() {
+                Some(base) => cover::fetch(&http, base, &book),
+                None => Err(crate::err!("no mirror available")),
+            };
             let _ = tx.send(Ev::Cover {
                 md5: book.md5,
-                result: result.map_err(|e| e.to_string()),
+                // Decoded here, off the UI thread.
+                result: result
+                    .map(|cover| cover.and_then(|c| Art::of(protocol, c)))
+                    .map_err(|e| e.to_string()),
             });
         });
     }
@@ -1327,11 +1378,12 @@ impl App {
         let Some(entry) = self.selected_entry().cloned() else {
             return;
         };
-        self.covers.insert(md5.clone(), Slot::Looking);
+        self.remember_cover(md5.clone(), Slot::Looking);
 
         let tx = self.tx.clone();
         let settings = self.settings.clone();
         let mirrors = self.mirrors.clone();
+        let protocol = self.protocol;
         std::thread::spawn(move || {
             // The file's own cover first, then a cover cached from a past search.
             let local = entry
@@ -1348,7 +1400,10 @@ impl App {
             };
             let _ = tx.send(Ev::Cover {
                 md5,
-                result: result.map_err(|e| e.to_string()),
+                // Decoded here, off the UI thread.
+                result: result
+                    .map(|cover| cover.and_then(|c| Art::of(protocol, c)))
+                    .map_err(|e| e.to_string()),
             });
         });
     }
@@ -1372,7 +1427,7 @@ impl App {
             extension: entry.extension.clone(),
             ..Default::default()
         };
-        let http = Http::new(settings.policy)?;
+        let http = Http::new(settings.policy);
         cover::fetch(&http, &base, &book)
     }
 
@@ -1386,6 +1441,36 @@ impl App {
             Tab::Library => self.selected_entry().map(|e| e.md5.clone()),
             Tab::Settings => None,
         }
+    }
+
+    /// File a finished cover lookup, evicting the oldest once the map is full.
+    ///
+    /// The entry being replaced keeps its original position: what matters is
+    /// bounding the map, and re-ordering on a repeat lookup would let a
+    /// selection bounced between two books hold everything else in memory.
+    fn remember_cover(&mut self, md5: String, slot: Slot) {
+        if self.covers.insert(md5.clone(), slot).is_none() {
+            self.cover_order.push_back(md5);
+        }
+        // The focused book is the one entry that must survive, since the next
+        // frame is about to draw it; it goes to the back of the queue instead.
+        let focused = self.focused_md5();
+        while self.cover_order.len() > MAX_COVERS {
+            let Some(oldest) = self.cover_order.pop_front() else {
+                break;
+            };
+            if Some(&oldest) == focused.as_ref() {
+                self.cover_order.push_back(oldest);
+                continue;
+            }
+            self.covers.remove(&oldest);
+        }
+    }
+
+    /// Drop every remembered cover.
+    fn forget_covers(&mut self) {
+        self.covers.clear();
+        self.cover_order.clear();
     }
 
     /// The cover to show right now, if there is one.
@@ -1455,12 +1540,8 @@ impl App {
             out.push_str(&match self.protocol {
                 Protocol::ITerm2 => graphics::iterm_image(&art.encoded, rect.width, rect.height),
                 _ => match &art.pixels {
-                    Some(image) => graphics::kitty_image(
-                        COVER_ID,
-                        &image.fit(400, 600),
-                        rect.width,
-                        rect.height,
-                    ),
+                    // Already scaled to THUMB_W × THUMB_H when it was decoded.
+                    Some(image) => graphics::kitty_image(COVER_ID, image, rect.width, rect.height),
                     // Kitty decodes PNG itself, so it can have the file.
                     None => graphics::kitty_png(COVER_ID, &art.encoded, rect.width, rect.height),
                 },
@@ -1678,9 +1759,32 @@ impl App {
         let Some(md5) = self.focused_md5() else {
             return;
         };
-        copy_to_clipboard(&md5);
+        // Handed to the event loop to write, the same way the cover is: deciding
+        // what to copy and putting an escape sequence on the real stdout are
+        // separate jobs, and only the first one belongs in a key handler that
+        // tests drive directly.
+        self.pending_yank = Some(md5.clone());
         self.error = None;
         self.status = format!("copied md5 {md5} to the clipboard");
+    }
+
+    /// The escape sequence that puts whatever the last keypress asked to copy
+    /// onto the clipboard, or `None` when nothing is waiting.
+    ///
+    /// Separate from writing it, like [`cover_escape`](Self::cover_escape), so
+    /// a test can check what would be sent without sending it.
+    fn clipboard_escape(&mut self) -> Option<String> {
+        self.pending_yank.take().map(|text| clipboard_osc(&text))
+    }
+
+    /// Put anything the last keypress asked to copy onto the clipboard.
+    fn flush_yank(&mut self) {
+        if let Some(escape) = self.clipboard_escape() {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            let _ = write!(stdout, "{escape}");
+            let _ = stdout.flush();
+        }
     }
 
     /// Forget the highlighted entry. The file itself is left alone.
@@ -1756,6 +1860,7 @@ impl App {
                 // blanks and re-arm the selection so it looks again.
                 if first_mirror {
                     self.covers.retain(|_, slot| !matches!(slot, Slot::Nothing));
+                    self.cover_order.retain(|md5| self.covers.contains_key(md5));
                     self.selection_moved();
                 }
             }
@@ -1828,36 +1933,12 @@ impl App {
             }
             Ev::Cover { md5, result } => {
                 let slot = match result {
-                    // What each protocol needs from a cover differs: iTerm2
-                    // takes the encoded file and wants nothing decoded, kitty
-                    // takes either, and half blocks can only draw pixels — so
-                    // a cover it cannot decode is no cover at all.
-                    Ok(Some(cover)) => match self.protocol {
-                        Protocol::ITerm2 => Slot::Ready(Box::new(Art {
-                            encoded: cover.encoded,
-                            pixels: None,
-                        })),
-                        Protocol::Kitty => {
-                            let pixels = cover.pixels();
-                            Slot::Ready(Box::new(Art {
-                                encoded: cover.encoded,
-                                pixels,
-                            }))
-                        }
-                        Protocol::Blocks => match cover.pixels() {
-                            Some(pixels) => Slot::Ready(Box::new(Art {
-                                encoded: Vec::new(),
-                                pixels: Some(pixels),
-                            })),
-                            None => Slot::Nothing,
-                        },
-                        Protocol::None => Slot::Nothing,
-                    },
+                    Ok(Some(art)) => Slot::Ready(Box::new(art)),
                     // A cover that will not come is not an error worth putting
                     // in front of someone who asked for a book.
                     Ok(None) | Err(_) => Slot::Nothing,
                 };
-                self.covers.insert(md5, slot);
+                self.remember_cover(md5, slot);
             }
         }
     }
@@ -2443,7 +2524,7 @@ impl App {
                 }
                 if !self.settings.covers {
                     self.erase_cover();
-                    self.covers.clear();
+                    self.forget_covers();
                     self.cover_due = None;
                 } else if self.protocol == Protocol::None {
                     self.protocol = graphics::detect();
@@ -4600,15 +4681,11 @@ fn short_duration(secs: u64) -> String {
     }
 }
 
-/// Put text on the system clipboard with an OSC 52 escape. Base64 is the
+/// The OSC 52 escape that puts text on the system clipboard. Base64 is the
 /// encoding the sequence mandates, and the crate already has an encoder for the
 /// image protocols, so this borrows it rather than growing a dependency.
-fn copy_to_clipboard(text: &str) {
-    use std::io::Write;
-    let escape = format!("\x1b]52;c;{}\x07", graphics::base64(text.as_bytes()));
-    let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "{escape}");
-    let _ = stdout.flush();
+fn clipboard_osc(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", graphics::base64(text.as_bytes()))
 }
 
 /// Error chains get long; the pane has one line for them.
@@ -4689,9 +4766,11 @@ mod tests {
             // an escape sequence to a terminal that is not there.
             protocol: Protocol::None,
             covers: HashMap::new(),
+            cover_order: VecDeque::new(),
             cover_due: None,
             painted: None,
             cover_area: None,
+            pending_yank: None,
             spinner: 0,
         }
     }
@@ -4995,6 +5074,126 @@ mod tests {
             a.status
         );
         assert!(a.status.contains("clipboard"));
+        // Queued rather than written: the key handler must not put an escape
+        // sequence on the real stdout, which under `cargo test` is the
+        // developer's own terminal and their own clipboard.
+        assert_eq!(a.pending_yank.as_deref(), Some(a.results[1].md5.as_str()));
+    }
+
+    /// The queue is drained once, so a redraw does not re-copy on every frame.
+    #[test]
+    fn a_yank_is_sent_once_and_then_forgotten() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, books(1));
+        a.table.select(Some(0));
+        press(&mut a, KeyCode::Char('y'));
+
+        let escape = a.clipboard_escape().expect("a yank should be waiting");
+        assert!(escape.starts_with("\x1b]52;c;") && escape.ends_with('\x07'));
+        assert!(escape.contains(&graphics::base64(a.results[0].md5.as_bytes())));
+        assert!(
+            a.clipboard_escape().is_none(),
+            "a second frame must not copy again"
+        );
+    }
+
+    /// Browsing is unbounded, so the map behind it must not be. A session
+    /// walking a long results list used to keep every thumbnail it ever drew.
+    #[test]
+    fn remembered_covers_are_capped() {
+        let mut a = app();
+        for i in 0..MAX_COVERS * 3 {
+            a.remember_cover(format!("{i:032x}"), Slot::Nothing);
+        }
+        assert!(
+            a.covers.len() <= MAX_COVERS + 1,
+            "{} covers retained",
+            a.covers.len()
+        );
+        assert_eq!(a.covers.len(), a.cover_order.len(), "the two must agree");
+        // The newest survive; the oldest are the ones let go.
+        assert!(a.covers.contains_key(&format!("{:032x}", MAX_COVERS * 3 - 1)));
+        assert!(!a.covers.contains_key(&format!("{:032x}", 0)));
+    }
+
+    /// A lookup starts as `Looking` and is replaced by its result, which must
+    /// not enter the queue a second time or the two would drift apart.
+    #[test]
+    fn upgrading_a_cover_in_place_does_not_double_count_it() {
+        let mut a = app();
+        let md5 = "a".repeat(32);
+        a.remember_cover(md5.clone(), Slot::Looking);
+        a.remember_cover(md5.clone(), Slot::Nothing);
+        assert_eq!(a.cover_order.len(), 1);
+        assert_eq!(a.covers.len(), 1);
+    }
+
+    /// Whatever is highlighted is about to be drawn, so it is the one entry
+    /// eviction may not take.
+    #[test]
+    fn the_focused_cover_is_never_evicted() {
+        let mut a = app();
+        a.mode = Mode::Browsing;
+        install(&mut a, books(1));
+        a.table.select(Some(0));
+        let focused = a.results[0].md5.clone();
+        a.remember_cover(focused.clone(), Slot::Nothing);
+        for i in 0..MAX_COVERS * 2 {
+            a.remember_cover(format!("{i:032x}"), Slot::Nothing);
+        }
+        assert!(
+            a.covers.contains_key(&focused),
+            "the highlighted book lost its cover"
+        );
+    }
+
+    /// A cover is decoded once, on the worker thread, and scaled on the way in.
+    /// The decoder will hand back up to sixteen megapixels, and the pane it is
+    /// drawn into is a few dozen cells wide.
+    #[test]
+    fn a_decoded_cover_is_scaled_before_it_is_kept() {
+        let cover = Cover::from_bytes(include_bytes!("../tests/fixtures/cover.jpg").to_vec())
+            .expect("the fixture is a JPEG");
+
+        for protocol in [Protocol::Kitty, Protocol::Blocks] {
+            let art = Art::of(protocol, cover.clone()).expect("a JPEG decodes");
+            let pixels = art.pixels.as_ref().expect("pixels for {protocol:?}");
+            assert!(
+                pixels.width <= THUMB_W && pixels.height <= THUMB_H,
+                "{protocol:?} kept {}×{}",
+                pixels.width,
+                pixels.height
+            );
+            // A small cover is not blown up to fill the bound.
+            assert_eq!((pixels.width, pixels.height), (24, 24));
+        }
+    }
+
+    /// iTerm2 hands the file to the terminal, so decoding it here would be work
+    /// for nothing; half blocks can only draw pixels, so a cover that will not
+    /// decode is no cover at all on that path.
+    #[test]
+    fn each_protocol_keeps_only_what_it_can_draw() {
+        let png = Cover::from_bytes(b"\x89PNG\r\n\x1a\nnot really".to_vec()).unwrap();
+
+        let iterm = Art::of(Protocol::ITerm2, png.clone()).unwrap();
+        assert!(iterm.pixels.is_none() && !iterm.encoded.is_empty());
+
+        // Kitty decodes PNG itself, so it keeps the file.
+        let kitty = Art::of(Protocol::Kitty, png.clone()).unwrap();
+        assert!(kitty.pixels.is_none() && !kitty.encoded.is_empty());
+
+        assert!(Art::of(Protocol::Blocks, png.clone()).is_none());
+        assert!(Art::of(Protocol::None, png).is_none());
+    }
+
+    #[test]
+    fn forgetting_covers_clears_both_halves() {
+        let mut a = app();
+        a.remember_cover("b".repeat(32), Slot::Nothing);
+        a.forget_covers();
+        assert!(a.covers.is_empty() && a.cover_order.is_empty());
     }
 
     #[test]

@@ -261,7 +261,7 @@ fn cmd_search(cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
     }
 
     let pool = resolve_pool(&settings, style)?;
-    let http = Http::new(settings.policy)?;
+    let http = Http::new(settings.policy);
 
     let spinner = if settings.quiet || settings.json {
         None
@@ -366,7 +366,7 @@ fn cmd_search(cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
 fn cmd_get(md5: &str, cli: &Cli, config: &Config, style: &Style) -> Result<i32> {
     let settings = settings(&cli.global, config);
     let pool = resolve_pool(&settings, style)?;
-    let http = Http::new(settings.policy)?;
+    let http = Http::new(settings.policy);
 
     let spinner = if settings.quiet {
         None

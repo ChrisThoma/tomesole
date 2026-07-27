@@ -381,7 +381,7 @@ pub fn fetch(
         crate::config::create_private_file(&part_path)?
     };
 
-    let total_expected = response.content_length.map(|l| l + already);
+    let total_expected = response.content_length.map(|l| l.saturating_add(already));
     let total_expected = total_expected.or(book.size_bytes);
     report(already, total_expected);
 
@@ -484,6 +484,12 @@ fn install(part: &Path, final_path: &Path, force: bool) -> Result<bool> {
                 let _ = std::fs::remove_file(part);
                 return Ok(false);
             }
+            // Not every filesystem has hard links — exFAT and FAT32 have none,
+            // and several network mounts refuse them — and an external drive is
+            // a perfectly ordinary place to keep a library. Fall back to an
+            // exclusive create, which is atomic in the same way; it costs a copy
+            // of the bytes, which only happens where the link was impossible.
+            Err(error) if !links_supported(&error) => return install_by_copy(part, final_path),
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
@@ -506,6 +512,64 @@ fn install(part: &Path, final_path: &Path, force: bool) -> Result<bool> {
             part.display()
         )
     })?;
+    Ok(true)
+}
+
+/// Whether a failed `hard_link` means "this file cannot be linked" rather than
+/// "this filesystem does not do links at all".
+///
+/// The two are told apart by errno: a filesystem without link support answers
+/// `Unsupported` or `PermissionDenied` depending on the platform, where a real
+/// problem — a full disk, a vanished source — reports itself specifically.
+fn links_supported(error: &std::io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// Install by copying into an exclusively-created file.
+///
+/// `create_new` fails if the name is taken, which is the same guarantee the
+/// hard link gave: an existing file is never replaced without `--force`.
+fn install_by_copy(part: &Path, final_path: &Path) -> Result<bool> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        // The hard-link path gives the final name the partial file's own mode,
+        // so match it rather than letting a copied book be more visible than a
+        // linked one.
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut destination = match options.open(final_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(part);
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not create {}", final_path.display()));
+        }
+    };
+
+    let mut source = std::fs::File::open(part)
+        .with_context(|| format!("could not reopen {}", part.display()))?;
+    if let Err(error) = std::io::copy(&mut source, &mut destination)
+        .and_then(|_| destination.flush())
+        .with_context(|| format!("could not write {}", final_path.display()))
+    {
+        // A half-written file under the real name is worse than no file.
+        drop(destination);
+        let _ = std::fs::remove_file(final_path);
+        return Err(error);
+    }
+    drop(destination);
+    drop(source);
+
+    std::fs::remove_file(part).with_context(|| format!("could not remove {}", part.display()))?;
     Ok(true)
 }
 
@@ -874,7 +938,6 @@ mod tests {
             allow_private_hosts: true,
             ..Default::default()
         })
-        .expect("client")
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1057,6 +1120,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// exFAT, FAT32 and several network mounts have no hard links, and an
+    /// external drive is an ordinary place to keep a library. The copy fallback
+    /// has to make the same promise the link did: the bytes land, the partial
+    /// goes, and an existing file is never replaced.
+    #[test]
+    fn the_copy_fallback_installs_without_a_hard_link() {
+        let dir = temp_dir("install-copy");
+        let part = dir.join("book.epub.part");
+        let final_path = dir.join("book.epub");
+        std::fs::write(&part, b"the whole book").unwrap();
+
+        assert!(install_by_copy(&part, &final_path).unwrap());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"the whole book");
+        assert!(!part.exists(), "the partial should be gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_copy_fallback_never_clobbers_an_existing_file() {
+        let dir = temp_dir("install-copy-exists");
+        let part = dir.join("book.epub.part");
+        let final_path = dir.join("book.epub");
+        std::fs::write(&part, b"new").unwrap();
+        std::fs::write(&final_path, b"existing").unwrap();
+
+        assert!(!install_by_copy(&part, &final_path).unwrap());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"existing");
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A copied book must be no more visible than a linked one, which inherits
+    /// the partial file's owner-only mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_copy_fallback_keeps_the_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("install-copy-mode");
+        let part = dir.join("book.epub.part");
+        let final_path = dir.join("book.epub");
+        std::fs::write(&part, b"private").unwrap();
+
+        install_by_copy(&part, &final_path).unwrap();
+        let mode = std::fs::metadata(&final_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "got {:o}", mode & 0o777);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only "this filesystem cannot do links" may fall through to the copy. A
+    /// full disk or a vanished partial has to stay an error.
+    #[test]
+    fn only_a_missing_link_facility_falls_back_to_copying() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::Unsupported, ErrorKind::PermissionDenied] {
+            assert!(!links_supported(&Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::StorageFull,
+            ErrorKind::AlreadyExists,
+        ] {
+            assert!(links_supported(&Error::from(kind)), "{kind:?}");
+        }
+    }
+
     #[test]
     fn forced_install_replaces_an_existing_file() {
         let dir = temp_dir("install-force");
@@ -1105,8 +1233,7 @@ mod tests {
             allow_private_hosts: true,
             request_timeout: Duration::from_millis(30),
             ..Default::default()
-        })
-        .unwrap();
+        });
         let dir = temp_dir("slow-stream");
         let mut b = book();
         b.md5 = digest;

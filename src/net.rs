@@ -225,7 +225,9 @@ pub struct Fetched {
 }
 
 impl Http {
-    pub fn new(policy: NetPolicy) -> Result<Self> {
+    /// Build a client. Infallible: configuring an agent touches no resource
+    /// that could refuse, and nothing is opened until the first request.
+    pub fn new(policy: NetPolicy) -> Self {
         let config = ureq::Agent::config_builder()
             .user_agent(USER_AGENT)
             .timeout_connect(Some(policy.connect_timeout))
@@ -234,10 +236,10 @@ impl Http {
             .max_redirects_will_error(false)
             .https_only(!policy.allow_http)
             .build();
-        Ok(Self {
+        Self {
             agent: ureq::Agent::new_with_config(config),
             policy,
-        })
+        }
     }
 
     /// Issue a GET, following redirects manually and validating every hop.
@@ -406,7 +408,7 @@ pub fn join_uri(base: &Uri, reference: &str) -> Result<Uri> {
         .ok_or_else(|| err!("base URL has no authority: {base}"))?
         .as_str();
 
-    let joined = if reference.contains("://") {
+    let joined = if has_scheme(reference) {
         reference.to_string()
     } else if let Some(rest) = reference.strip_prefix("//") {
         format!("{scheme}://{rest}")
@@ -426,6 +428,26 @@ pub fn join_uri(base: &Uri, reference: &str) -> Result<Uri> {
         .parse()
         .map_err(|e| Error::from(format!("invalid URL `{joined}`: {e}")))?;
     Ok(uri)
+}
+
+/// Whether a reference names its own scheme, as in `https://host/path`.
+///
+/// Testing for a bare `://` anywhere in the string is not good enough: Libgen
+/// and its interstitials routinely emit links that carry a URL inside a query
+/// parameter — `/out.php?u=https://cdn.example/f` — and reading one of those as
+/// absolute drops the base and yields a host-less URI that fails validation
+/// several steps later with an error naming the wrong thing. The separator has
+/// to come before anything that would have started a path, query or fragment.
+fn has_scheme(reference: &str) -> bool {
+    let Some(colon) = reference.find("://") else {
+        return false;
+    };
+    let scheme = &reference[..colon];
+    !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Collapse `.` and `..` segments so a relative link cannot climb out of the
@@ -470,6 +492,7 @@ fn normalize_dot_segments(url: &str) -> String {
 /// Keeps the RFC 3986 unreserved set, encodes everything else. Spaces become
 /// `+`, which is what the Libgen search form expects.
 pub fn encode_query_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(value.len() + 8);
     for &byte in value.as_bytes() {
         match byte {
@@ -479,7 +502,8 @@ pub fn encode_query_value(value: &str) -> String {
             b' ' => out.push('+'),
             _ => {
                 out.push('%');
-                out.push_str(&format!("{byte:02X}"));
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
             }
         }
     }
@@ -636,6 +660,63 @@ mod tests {
             join_uri(&base, "get.php#frag").unwrap().to_string(),
             "https://libgen.li/a/b/get.php"
         );
+    }
+
+    /// Interstitials and redirects routinely carry a URL inside a query
+    /// parameter. Reading the `://` in one as a scheme dropped the base and
+    /// produced a host-less URI that failed validation much later on.
+    #[test]
+    fn a_url_inside_a_query_string_does_not_look_absolute() {
+        let base = uri("https://libgen.li/a/b/page.php");
+        assert_eq!(
+            join_uri(&base, "/out.php?u=https://cdn.example/f")
+                .unwrap()
+                .to_string(),
+            "https://libgen.li/out.php?u=https://cdn.example/f"
+        );
+        assert_eq!(
+            join_uri(&base, "get.php?ref=http://x.example/y")
+                .unwrap()
+                .to_string(),
+            "https://libgen.li/a/b/get.php?ref=http://x.example/y"
+        );
+        // A protocol-relative reference carrying one stays protocol-relative.
+        assert_eq!(
+            join_uri(&base, "//cdn.example/f?to=https://z.example/q")
+                .unwrap()
+                .to_string(),
+            "https://cdn.example/f?to=https://z.example/q"
+        );
+    }
+
+    #[test]
+    fn a_genuine_scheme_is_still_recognised() {
+        assert!(has_scheme("https://libgen.li/x"));
+        assert!(has_scheme("HTTP://libgen.li/x"));
+        assert!(has_scheme("ftp://libgen.li/x"));
+        assert!(!has_scheme("/out.php?u=https://x"));
+        assert!(!has_scheme("get.php?ref=http://x"));
+        assert!(!has_scheme("//cdn.example/x"));
+        assert!(!has_scheme("://nothing"));
+        assert!(!has_scheme("9x://digits-first"));
+        assert!(!has_scheme("plain/path"));
+    }
+
+    /// A non-http scheme smuggled through a query must still be refused when
+    /// it is the reference proper.
+    #[test]
+    fn a_joined_non_http_scheme_is_refused() {
+        let base = uri("https://libgen.li/ads.php");
+        let policy = NetPolicy::default();
+        for hostile in ["file:///etc/passwd", "ftp://libgen.li/x", "gopher://x/1"] {
+            // Refused either at the join, when `http::Uri` will not hold it, or
+            // at the shape check. Which one does not matter; both are a stop.
+            let refused = match join_uri(&base, hostile) {
+                Ok(joined) => check_uri_shape(&joined, &policy).is_err(),
+                Err(_) => true,
+            };
+            assert!(refused, "{hostile} should not be reachable");
+        }
     }
 
     #[test]

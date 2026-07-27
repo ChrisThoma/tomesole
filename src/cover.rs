@@ -203,8 +203,14 @@ fn download(http: &Http, url: &Uri, from: &Uri) -> Result<Option<Cover>> {
 /// not fetched again on every visit.
 const MISSING: &str = "none";
 
-fn cache_path(md5: &str, extension: &str) -> PathBuf {
-    crate::config::cover_cache_dir().join(format!("{md5}.{extension}"))
+/// Where a cover for this MD5 lives, or `None` when the key is not one.
+///
+/// Every caller reaches here with an MD5 that came from a mirror or a history
+/// row, and this is the only place in the module that turns one into a path, so
+/// the check belongs here rather than at each entry point.
+fn cache_path(md5: &str, extension: &str) -> Option<PathBuf> {
+    crate::model::is_md5(md5)
+        .then(|| crate::config::cover_cache_dir().join(format!("{md5}.{extension}")))
 }
 
 /// The cover for this MD5 if one was fetched in a past search, without going
@@ -219,11 +225,12 @@ pub fn cached(md5: &str) -> Option<Option<Cover>> {
 /// `Some(None)` means "cached, and there is no cover"; `None` means "not
 /// cached, go and look".
 fn from_cache(md5: &str) -> Option<Option<Cover>> {
-    if cache_path(md5, MISSING).exists() {
+    if cache_path(md5, MISSING).is_some_and(|path| path.exists()) {
         return Some(None);
     }
     for extension in ["jpg", "png", "img"] {
-        if let Ok(bytes) = std::fs::read(cache_path(md5, extension))
+        if let Some(path) = cache_path(md5, extension)
+            && let Ok(bytes) = std::fs::read(path)
             && !bytes.is_empty()
             && let Some(cover) = Cover::classify(bytes)
         {
@@ -241,10 +248,14 @@ fn store(md5: &str, cover: Option<&Cover>) {
     }
     match cover {
         Some(cover) => {
-            let _ = std::fs::write(cache_path(md5, cover.extension()), &cover.encoded);
+            if let Some(path) = cache_path(md5, cover.extension()) {
+                let _ = std::fs::write(path, &cover.encoded);
+            }
         }
         None => {
-            let _ = std::fs::write(cache_path(md5, MISSING), b"");
+            if let Some(path) = cache_path(md5, MISSING) {
+                let _ = std::fs::write(path, b"");
+            }
         }
     }
 }
@@ -403,8 +414,7 @@ mod tests {
             allow_http: true,
             allow_private_hosts: true,
             ..Default::default()
-        })
-        .unwrap();
+        });
         let url: Uri = format!("http://127.0.0.1:{port}/cover.jpg")
             .parse()
             .unwrap();
@@ -422,7 +432,7 @@ mod tests {
     #[ignore = "needs the network and a working mirror"]
     fn covers_can_be_fetched_from_a_real_mirror() {
         let policy = crate::net::NetPolicy::default();
-        let http = Http::new(policy).unwrap();
+        let http = Http::new(policy);
         let pool = crate::mirror::resolve(
             &policy,
             crate::mirror::ResolveOptions {
@@ -456,6 +466,34 @@ mod tests {
             }
         }
         eprintln!("{found} of 3 records had a cover");
+    }
+
+    /// Every key reaching the cache came from a mirror or a history row, and
+    /// this is the only place one becomes a path, so nothing that is not an
+    /// MD5 may get that far.
+    #[test]
+    fn only_a_real_md5_names_a_cache_file() {
+        assert!(cache_path("1b9159991f7fb1b3910c0be9ebf7e595", "jpg").is_some());
+        for hostile in [
+            "../../../../etc/passwd",
+            "..",
+            "",
+            "not-a-hash",
+            "1b9159991f7fb1b3910c0be9ebf7e59",  // one short
+            "1b9159991f7fb1b3910c0be9ebf7e5955", // one long
+            "../1b9159991f7fb1b3910c0be9ebf7e5",
+        ] {
+            assert!(cache_path(hostile, "jpg").is_none(), "{hostile:?}");
+        }
+        // And the public read path answers "not cached" rather than reaching
+        // for a file whose name it should not be building.
+        assert_eq!(cached("../../etc/passwd"), None);
+    }
+
+    #[test]
+    fn a_cache_path_is_always_a_direct_child_of_the_cache_directory() {
+        let path = cache_path("1b9159991f7fb1b3910c0be9ebf7e595", "jpg").unwrap();
+        assert_eq!(path.parent(), Some(crate::config::cover_cache_dir().as_path()));
     }
 
     #[test]

@@ -5,7 +5,10 @@
 //!
 //! * **No shell is involved.** The path is passed as a single argument to
 //!   `Command`, never interpolated into a command line, so a filename cannot
-//!   turn into an argument or a command of its own.
+//!   turn into an argument or a command of its own. On Windows that means
+//!   calling `ShellExecuteW` directly rather than going through `cmd /C start`:
+//!   `cmd` is a shell, and it splits an unquoted argument on `&`, which is a
+//!   character titles are allowed to contain.
 //! * **The path is canonicalised first**, which both proves the file is still
 //!   there and guarantees it is absolute — so it cannot start with `-` and be
 //!   read as a flag by whatever we hand it to.
@@ -34,8 +37,17 @@ pub fn open(path: &Path, reader: Option<&str>) -> Result<()> {
         Some(command) => {
             // A reader like `zathura` stays in the foreground for as long as
             // the book is open, so this one is started and let go of.
-            detach(Command::new(command).arg(&path)).with_context(|| {
-                format!("could not start `{command}` — is it installed and on your PATH?")
+            //
+            // Split on whitespace so `mupdf -r 120` works, since the config
+            // calls this a command. Still no shell: the parts become argv
+            // entries directly, and the path is always the last one.
+            //
+            // The match arm already trimmed this and rejected the empty string,
+            // so there is always a first word to take.
+            let mut parts = command.split_whitespace();
+            let program = parts.next().unwrap_or(command);
+            detach(Command::new(program).args(parts).arg(&path)).with_context(|| {
+                format!("could not start `{program}` — is it installed and on your PATH?")
             })
         }
         None => open_with_default(&path),
@@ -54,8 +66,9 @@ pub fn reveal(path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // Explorer reports failure even when it worked, so its exit status is
-        // not worth consulting.
-        detach(Command::new("explorer").arg(format!("/select,{}", path.display())))
+        // not worth consulting. It also does not understand the `\\?\` prefix
+        // that canonicalising adds.
+        detach(Command::new("explorer").arg(format!("/select,{}", display_path(&path).display())))
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -89,9 +102,7 @@ fn open_with_default(path: &Path) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        // The empty string is `start`'s window-title argument; without it a
-        // quoted path would be taken for the title.
-        detach(Command::new("cmd").arg("/C").arg("start").arg("").arg(path))
+        shell_execute(path)
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -106,6 +117,72 @@ fn open_with_default(path: &Path) -> Result<()> {
                 path.display()
             )
         })
+    }
+}
+
+/// Hand a path to the shell's default handler for its type.
+///
+/// This is what a double-click does, and it is the reason nothing here goes
+/// near `cmd /C start`: `ShellExecuteW` takes the path as one opaque argument,
+/// so a book called `Notes & Queries.epub` opens instead of being split at the
+/// ampersand and run as two commands.
+#[cfg(target_os = "windows")]
+fn shell_execute(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let file: Vec<u16> = display_path(path)
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let operation: Vec<u16> = "open".encode_utf16().chain([0]).collect();
+
+    // SAFETY: both strings are NUL-terminated and live for the duration of the
+    // call. A null window handle means "no parent", and the remaining pointers
+    // are the documented nulls for "no arguments" and "no working directory".
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    // The return is typed as a handle for historical reasons but is really a
+    // status: anything above 32 is success, and anything at or below it is one
+    // of the legacy error codes, which overlap the ordinary system ones.
+    let status = result as isize;
+    if status > 32 {
+        return Ok(());
+    }
+    Err(std::io::Error::from_raw_os_error(status as i32)).with_context(|| {
+        format!(
+            "could not open {} — no application is associated with this file type",
+            path.display()
+        )
+    })
+}
+
+/// Strip the `\\?\` prefix that canonicalising adds on Windows.
+///
+/// It is the extended-length form, which the file APIs understand but the shell
+/// and Explorer do not: handed one, Explorer silently opens the user's
+/// documents folder instead of selecting the file.
+#[cfg(target_os = "windows")]
+fn display_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        // The UNC form has to keep a leading separator to stay a UNC path.
+        Some(rest) => match rest.strip_prefix("UNC\\") {
+            Some(share) => PathBuf::from(format!(r"\\{share}")),
+            None => PathBuf::from(rest),
+        },
+        None => path.to_path_buf(),
     }
 }
 
@@ -213,6 +290,26 @@ mod tests {
         // An absolute path can never be mistaken for a flag by the program we
         // hand it to, which is the point of canonicalising.
         assert!(resolved.to_string_lossy().starts_with('/') || cfg!(windows));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The config calls `reader` a command, so one with arguments has to work.
+    /// Splitting happens here, into argv entries — there is still no shell, so
+    /// the filename can never become one of them.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_reader_may_carry_arguments() {
+        let dir = std::env::temp_dir();
+        let file = dir.join(format!("tomesole-launch-a-{}.txt", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+
+        // `true` ignores its arguments and exits zero, so this proves the
+        // program name was taken from the first word rather than the whole
+        // string being looked up as one.
+        assert!(open(&file, Some("true --page 3")).is_ok());
+        // The whole string as a program name is what used to happen, and there
+        // is no such executable.
+        assert!(open(&file, Some("tomesole-nonesuch --page 3")).is_err());
         let _ = std::fs::remove_file(&file);
     }
 

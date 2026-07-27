@@ -3,6 +3,11 @@
 //! The config format is intentionally trivial — `key = value` lines with `#`
 //! comments — because the whole configurable surface is a handful of scalars
 //! and a mirror list. A TOML parser would be a large dependency for that.
+//!
+//! One consequence worth stating: a `#` always starts a comment, so no value
+//! can contain one. Nothing in the settable surface needs it — a mirror URL has
+//! no fragment, a reader is a command — and a quoting rule would be a lot of
+//! machinery to hold one character nobody has asked for.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -304,14 +309,33 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
         return home_dir();
     }
-    match path.strip_prefix("~/") {
+    // Windows shells do not expand `~` themselves, so anyone typing it into the
+    // config file will have written it with the separator they use.
+    match path
+        .strip_prefix("~/")
+        .or_else(|| cfg!(windows).then(|| path.strip_prefix("~\\")).flatten())
+    {
         Some(rest) => home_dir().join(rest),
         None => PathBuf::from(path),
     }
 }
 
+/// The user's home directory.
+///
+/// `HOME` first, so an explicit setting always wins, then `USERPROFILE`, which
+/// is what Windows actually sets — cmd and PowerShell leave `HOME` unset, and
+/// without this every path in this module (config, cache, history, and the
+/// default download directory) would land in the working directory instead.
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
+    let from_env = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    from_env("HOME")
+        .or_else(|| {
+            if cfg!(windows) {
+                from_env("USERPROFILE")
+            } else {
+                None
+            }
+        })
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -581,5 +605,38 @@ mod tests {
         assert!(expanded.is_absolute() || expanded.starts_with("."));
         assert!(expanded.ends_with("x"));
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    /// A tilde is only a home directory when it leads a path. `~backup.epub`
+    /// is a filename, and on Unix a backslash is a legal one.
+    #[test]
+    fn a_tilde_that_is_not_a_prefix_is_left_alone() {
+        assert_eq!(expand_tilde("~backup"), PathBuf::from("~backup"));
+        assert_eq!(expand_tilde("books/~x"), PathBuf::from("books/~x"));
+        assert_eq!(expand_tilde("~"), home_dir());
+        #[cfg(windows)]
+        assert_eq!(expand_tilde("~\\x"), home_dir().join("x"));
+        #[cfg(not(windows))]
+        assert_eq!(expand_tilde("~\\x"), PathBuf::from("~\\x"));
+    }
+
+    /// Every path this module produces hangs off the home directory, so a
+    /// platform where it cannot be found puts the config, the cache, the
+    /// history and the downloads in whatever directory the user happened to be
+    /// standing in. Windows leaves `HOME` unset.
+    #[test]
+    fn the_home_directory_is_found_on_every_platform() {
+        let home = home_dir();
+        assert!(
+            home != Path::new("."),
+            "no home directory: HOME={:?} USERPROFILE={:?}",
+            std::env::var_os("HOME"),
+            std::env::var_os("USERPROFILE"),
+        );
+        assert!(home.is_absolute(), "{home:?} should be absolute");
+        // And the derived paths inherit it rather than going relative.
+        for path in [config_path(), history_path(), mirror_cache_path()] {
+            assert!(path.is_absolute(), "{path:?} should be absolute");
+        }
     }
 }

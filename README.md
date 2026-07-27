@@ -159,7 +159,11 @@ Every byte, header and filename from a mirror is treated as attacker-controlled.
   image signature. The in-tree JPEG decoder bounds-checks every length and
   index, and the tests fuzz it with truncated and corrupted files.
 - **Opening a book** starts another program, so the path is canonicalised and
-  passed as a single argument to `exec` with no shell in the chain.
+  passed as a single argument to `exec` with no shell in the chain — on Windows
+  that means `ShellExecuteW` rather than `cmd /C start`, which would split a
+  title containing an ampersand.
+- **Displayed metadata** is stripped of control characters, so a mirror cannot
+  put an escape sequence in a title and repaint the terminal with it.
 
 ## Dependencies and tests
 
