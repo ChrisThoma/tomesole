@@ -1,13 +1,13 @@
 [package]
 name = "tomesole"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.91"
 description = "A terminal client (TUI and CLI) for searching and downloading from Library Genesis"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/ChrisThoma/tomesole"
-homepage = "https://individuation.dev/projects/tomesole/"
+homepage = "https://dreamrot.dev/projects/tomesole/"
 keywords = ["libgen", "library-genesis", "ebooks", "tui", "cli"]
 categories = ["command-line-utilities"]
 # The demo GIF is a megabyte of README decoration. It lives in the repo and the
